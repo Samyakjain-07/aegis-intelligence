@@ -1,0 +1,43 @@
+# --- Python ---
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Node / frontend ---
+node_modules/
+dist/
+build/
+.vite/
+
+# --- Env / secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Docker / infra ---
+*.log
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Repo-specific ---
+# Alembic migrations themselves are checked in (not ignored) — this only
+# covers ad-hoc local db dumps / scratch files that scripts/ might produce.
+*.db
+*.sqlite3
+scripts/**/*.tmp
+
+# Eval harness run outputs (RAGAS/DeepEval reports), not the gold Q&A set itself
+eval/results/
+eval/**/*.report.json

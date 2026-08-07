@@ -1,0 +1,21 @@
+# services/ingestion — document parsing / chunking / embedding pipeline
+# Loose (>=) pins for now; see docs/DECISIONS_LOG.md for rationale on when
+# to move to a fully locked file (e.g. via pip-compile).
+#
+# NOTE (Windows): camelot-py[cv] requires Ghostscript installed at the OS
+# level. This is a manual install step, not something pip/winget handles —
+# see docs/DECISIONS_LOG.md.
+
+celery>=5.4
+redis>=5.0
+pymupdf>=1.24
+camelot-py[cv]>=0.11
+sqlalchemy>=2.0
+psycopg2-binary>=2.9
+qdrant-client>=1.9
+cohere>=5.5
+pydantic-settings>=2.3
+python-dotenv>=1.0
+pytest>=8.2
+mypy>=1.10
+ruff>=0.5

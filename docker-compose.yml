@@ -1,0 +1,56 @@
+# Aegis Intelligence — local infra
+#
+# Local infra only: postgres, qdrant, redis. `services/api` and
+# `services/ingestion` are NOT containerized here yet — their Dockerfiles
+# don't exist until Phase 9 (see PROJECT_HANDBOOK.md and
+# docs/DECISIONS_LOG.md). Adding them now would reference Dockerfiles that
+# don't exist and break `docker compose up`. Until then they run directly
+# from their venvs (see PROJECT_HANDBOOK.md §5.3) and connect to these
+# services via the host-mapped ports below.
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-changeme}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${POSTGRES_DB:-aegis}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-changeme} -d ${POSTGRES_DB:-aegis}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    restart: unless-stopped
+    ports:
+      # Host 6335 -> container 6333: host 6333 is already bound by an
+      # unrelated Docker container from a different local project. Only
+      # the host side is remapped; Qdrant still listens on 6333 inside
+      # the container. See docs/DECISIONS_LOG.md.
+      - "6335:6333"
+      # Host 6336 -> container 6334 (gRPC): same collision as the REST
+      # port above, same unrelated local project. Container still listens
+      # on 6334 internally. See docs/DECISIONS_LOG.md.
+      - "6336:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  postgres_data:
+  qdrant_data:
+  redis_data:

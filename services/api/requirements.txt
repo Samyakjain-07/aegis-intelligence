@@ -1,0 +1,21 @@
+# services/api — FastAPI backend
+# Loose (>=) pins for now; see docs/DECISIONS_LOG.md for rationale on when
+# to move to a fully locked file (e.g. via pip-compile).
+
+fastapi>=0.111
+uvicorn[standard]>=0.30
+sqlalchemy>=2.0
+alembic>=1.13
+psycopg2-binary>=2.9
+pydantic>=2.7
+pydantic-settings>=2.3
+python-dotenv>=1.0
+celery>=5.4
+redis>=5.0
+qdrant-client>=1.9
+cohere>=5.5
+python-multipart>=0.0.9
+pytest>=8.2
+httpx>=0.27
+mypy>=1.10
+ruff>=0.5
