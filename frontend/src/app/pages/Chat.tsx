@@ -67,7 +67,7 @@ export function Chat() {
               <button 
                 className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-[#111113] hover:bg-zinc-800 border border-zinc-700 text-zinc-300 text-sm font-medium rounded-lg transition-colors"
               >
-                <Search className="w-4 h-4" />
+                <SearchIcon className="w-4 h-4" />
                 Query Global Index
               </button>
             </div>

@@ -1,98 +1,197 @@
-# Progress Snapshot — 2026-08-06
+# Progress Snapshot — 2026-08-08 (Phase 4)
 
-> Repo state check: not a git repository (no `.git`, `git` not on PATH in this
-> environment) — no commit history, no `git status` diff available. No
-> `docs/` planning files exist on disk (project-structure doc, architecture
-> doc, ER model doc are **not present** in the repo) — this snapshot's build
-> order and ER model are taken from prior-session context supplied by the
-> user, not from files in this repo.
+> Repo state check: real git repository (`git log` shows one prior commit,
+> `f80737c chore: initial commit`; current tree has uncommitted changes —
+> `.env.example`, `.gitignore`, `PROJECT_HANDBOOK.md`,
+> `docs/DECISIONS_LOG.md`, `docs/progress.md`,
+> `frontend/src/app/pages/Chat.tsx`, `frontend/src/app/pages/Library.tsx`
+> modified, the stray `frontend/...zip` deleted, plus untracked
+> `docs/Financial_RAG_Project_Structure.md`, `docs/architecture.md`,
+> `frontend/.env.example`, `frontend/src/app/lib/`, `migrations/`,
+> `scripts/`, `services/api/alembic.ini`, `services/api/pyproject.toml`,
+> `services/api/src/`, `services/api/tests/`). Verified by reading files
+> and running each phase's own commands (`mypy`, `ruff`, `pytest`, a real
+> `alembic upgrade head`, a real `uvicorn` boot, `curl` against every
+> endpoint including real multipart uploads, `scripts/seed_dev_data.py`
+> run twice to confirm idempotency, and a full headless-Playwright pass
+> against the actual running frontend + backend) — not by folder
+> existence.
 
 ## Build Order Status
 
 | # | Phase | Status | Reason |
 |---|-------|--------|--------|
-| 1 | Fix Search crash | **Not Started** | Bug still present — [Chat.tsx:70](../frontend/src/app/pages/Chat.tsx#L70) uses `Search` but only `SearchIcon` is imported ([Chat.tsx:230](../frontend/src/app/pages/Chat.tsx#L230)). Throws `ReferenceError` whenever `activeProject.isEmpty` is true. |
-| 2 | DB schema | **Not Started** | `services/api` directory exists but is completely empty — no `src/`, no `models/`, no `db/`, no files at all. |
-| 3 | FastAPI skeleton | **Not Started** | No Python files anywhere in the repo. No `main.py`, no `requirements.txt`/`pyproject.toml`. |
-| 4 | Library page vertical slice | **In Progress (UI-only)** | [Library.tsx](../frontend/src/app/pages/Library.tsx) exists with full UI (empty state + data grid) but is 100% hardcoded `MOCK_DOCS`, no fetch/API calls, no upload handler wired. Blocked on phases 2–3 for real data. |
-| 5 | Ingestion pipeline | **Not Started** | `services/ingestion` directory exists, zero files. |
-| 6 | Retrieval/generation pipeline | **Not Started** | No backend exists to retrieve or generate anything. |
-| 7 | Remaining pages | **In Progress (UI-only)** | Chat, Compare, Admin all exist as static/mock UI ([Chat.tsx](../frontend/src/app/pages/Chat.tsx), [Compare.tsx](../frontend/src/app/pages/Compare.tsx), [Admin.tsx](../frontend/src/app/pages/Admin.tsx)) — all hardcoded mock data, no live wiring. |
+| 1 | Fix Search crash | **Done** | [Chat.tsx:70](../frontend/src/app/pages/Chat.tsx#L70) renders `<SearchIcon .../>`, matching the aliased import at [Chat.tsx:230](../frontend/src/app/pages/Chat.tsx#L230). See `docs/DECISIONS_LOG.md` 2026-08-07 entry. |
+| 2 | DB schema | **Done** | All 11 ER entities from `docs/architecture.md` §7 exist as typed SQLAlchemy 2.0 models under [services/api/src/models/db/](../services/api/src/models/db). `pytest tests\unit -v` (3/3) re-verified clean this phase alongside Phase 4's model change. See the seven `docs/DECISIONS_LOG.md` entries dated 2026-08-07. |
+| 3 | FastAPI skeleton | **Done** | `main.py` registers every v1 router + three middleware stubs (now also `CORSMiddleware`, added this phase — see below). All 11 planned endpoints exist, fully typed. See the `docs/DECISIONS_LOG.md` entry dated 2026-08-08. |
+| 4 | Library page vertical slice | **Done** | `GET/POST /documents` are real (not stubs): `GET` returns every `Document` joined with its `Company`; `POST` accepts a real multipart PDF upload, find-or-creates the `Company` by ticker, saves the PDF to local disk, writes a `Document` row (`status=pending`), and enqueues a real (no-op) Celery task. [Library.tsx](../frontend/src/app/pages/Library.tsx) fetches real data and its upload dialog posts real uploads — `MOCK_DOCS` is gone. Verified end-to-end with a headless-Playwright run against the actual running frontend + backend (screenshots showed real seeded rows, a submitted upload appearing live, zero console errors) — not just `curl`. See the five `docs/DECISIONS_LOG.md` entries dated 2026-08-08 (Phase 4). |
+| 5 | Ingestion pipeline | **Not Started** | `services/ingestion` has only `requirements.txt`; zero application code. Phase 4's Celery stub task (`services/api/src/infra/celery_app.py`) is registered under the task name (`ingest_document`) Phase 5's real task will reuse. |
+| 6 | Retrieval/generation pipeline | **Not Started** | `POST /query`/`POST /query/followup` exist as typed stubs (Phase 3) but return placeholder data; no retrieval or generation logic exists yet. |
+| 7 | Remaining pages | **In Progress (UI-only)** | Chat, Compare, Admin all still hardcoded mock data. `GET /admin/analytics` and `GET /admin/flagged-answers` exist as typed stubs (Phase 3) but return placeholder data. |
 | 8 | Eval/observability | **Not Started** | `eval/` directory exists, zero files. |
-| 9 | Deployment | **Not Started** | `infra/k8s` and `infra/terraform` exist but are empty. No `Dockerfile`, no `docker-compose.yml` anywhere in the repo. No `.github/workflows` files despite the directory existing. |
+| 9 | Deployment | **Not Started** | No `Dockerfile`, no prod compose file, no `.github/workflows` files. |
 
 ## File Inventory
 
-### frontend/ (only area with real content — Figma/shadcn export, UI mockup)
+### frontend/ — Phase 4 output
 
 | Path | Status | Description |
 |------|--------|-------------|
-| [package.json](../frontend/package.json) | Complete (scaffold) | Vite + React 18 + Tailwind 4 deps; also carries dead MUI/Emotion deps and optional `react`/`react-dom` peerDeps (see Known Issues). Only `dev`/`build` scripts, no `test`, `lint`, `typecheck`. |
-| [vite.config.ts](../frontend/vite.config.ts) | Complete | Vite config w/ custom `figma:asset/` resolver (points at `src/assets`, which doesn't exist yet), React + Tailwind plugins. |
-| — tsconfig | **Missing** | No `tsconfig.json`/`tsconfig.*.json` in `frontend/` despite all-TS/TSX source. |
-| [src/main.tsx](../frontend/src/main.tsx) | Complete | Entry point. |
-| [src/app/App.tsx](../frontend/src/app/App.tsx) | Complete | Wraps `RouterProvider`. |
-| [src/app/routes.tsx](../frontend/src/app/routes.tsx) | Complete | 4 routes: `/` (Chat), `/library`, `/compare`, `/admin`, all under `Layout`. |
-| [src/app/components/Layout.tsx](../frontend/src/app/components/Layout.tsx) | Complete (mock) | Sidebar shell, project switcher (hand-rolled dropdown), citation side-panel, "new project" modal (hand-rolled, not using installed Radix `Dialog`). All state/data is local mock (`MOCK_PROJECTS`). |
-| [src/app/pages/Chat.tsx](../frontend/src/app/pages/Chat.tsx) | Complete (mock) | Chat UI w/ mock Q&A, mock citations, mock data table. **Contains the Search/SearchIcon crash bug.** |
-| [src/app/pages/Library.tsx](../frontend/src/app/pages/Library.tsx) | Complete (mock) | Document grid UI, empty state, search/filter UI — all client-side filtering over `MOCK_DOCS`. |
-| [src/app/pages/Compare.tsx](../frontend/src/app/pages/Compare.tsx) | Complete (mock) | Metric comparison table over `MOCK_METRICS`. |
-| [src/app/pages/Admin.tsx](../frontend/src/app/pages/Admin.tsx) | Complete (mock) | KPI cards + Recharts area chart + flagged-queries table, all over inline mock arrays. |
-| [src/app/components/ui/*.tsx](../frontend/src/app/components/ui) (55 files) | Complete (shadcn/Radix library) | Full shadcn/ui component set generated by the Figma export (accordion, dialog, dropdown-menu, sheet, sidebar, etc.). Installed but **not used** by the actual pages/Layout — pages hand-roll their own modals/dropdowns instead. |
-| [src/app/components/figma/ImageWithFallback.tsx](../frontend/src/app/components/figma/ImageWithFallback.tsx) | Complete | Figma-export utility component. |
-| [src/styles/theme.css](../frontend/src/styles/theme.css) | Complete (unused) | Full `:root`/`.dark` CSS-variable token system + Tailwind `@theme inline` mapping. Defined but disconnected — see Known Issues. |
-| [src/styles/index.css](../frontend/src/styles/index.css), [fonts.css](../frontend/src/styles/fonts.css), [tailwind.css](../frontend/src/styles/tailwind.css) | Complete | Style entrypoints. |
-| `Financial Research Intelligence Platform.zip` | Cruft | Leftover Figma export zip committed inside `frontend/` — not referenced by build. |
+| [src/app/pages/Library.tsx](../frontend/src/app/pages/Library.tsx) | Complete | `MOCK_DOCS` removed entirely. Fetches real `Document` rows on mount (loading/error/retry states) via `lib/api.ts`; a new hand-rolled upload dialog (matching `Layout.tsx`'s existing modal styling, not the unused shadcn `Dialog`) posts a real `multipart/form-data` upload and prepends the created row on success. Status badge now handles all four `DocumentStatus` values (`pending`/`processing` → "Processing", `completed` → "Indexed", `failed` → new "Failed" state). |
+| [src/app/lib/api.ts](../frontend/src/app/lib/api.ts) | Complete (new) | Shared fetch client: `API_BASE_URL` (from `VITE_API_BASE_URL`, defaults to `http://localhost:8001/api/v1` — moved off uvicorn's own default of 8000 in a same-day setup fix, port 8000 being permanently occupied on this dev machine by an unrelated project's Docker container; see `docs/DECISIONS_LOG.md`'s 2026-08-09 entry), TS types hand-mirroring `models/schemas/document.py`'s Pydantic schemas, `fetchDocuments`/`uploadDocument`, and FastAPI-error-envelope parsing. |
+| [.env.example](../frontend/.env.example) | Complete (new) | Documents `VITE_API_BASE_URL`. |
 
-### services/api/src/models/db/ — 11-entity ER model progress
+### frontend/ (Figma/shadcn export, UI mockup — everything else unchanged this phase)
 
-**Directory does not exist.** `services/api` has zero files (confirmed via recursive listing — no `src`, no subdirectories at all). Agreed build order was:
-`base.py -> enums.py -> organization.py -> user.py -> company.py -> document.py -> document_chunk.py -> [table_data.py, conversation.py, query.py, answer.py, citation.py, eval_result.py]`
+Same state as the previous snapshot for every page except `Library.tsx`
+(see git history for the full table).
 
-**Status: 0 / 11 entities started.** Not even `base.py` exists. This is the current bottleneck — nothing downstream (FastAPI app, ingestion, retrieval) can start until this begins.
+### services/api/ — Phase 4 output (Phase 3 output unchanged, listed after)
 
-### Everything else
+| Path | Status | Description |
+|------|--------|-------------|
+| [src/models/db/enums.py](../services/api/src/models/db/enums.py) | Updated | Added `DocumentStatus` (`PENDING`/`PROCESSING`/`COMPLETED`/`FAILED`) — the Phase 2-flagged gap, resolved this phase. |
+| [src/models/db/document.py](../services/api/src/models/db/document.py) | Updated | Added `title: Mapped[str]` and `status: Mapped[DocumentStatus]` (default `PENDING`) — both additive columns, both Phase 2-flagged gaps. |
+| [src/infra/storage.py](../services/api/src/infra/storage.py) | Complete (new) | `save_uploaded_pdf` — writes an uploaded PDF to local disk under `<repo root>/data/uploads/<document_id><ext>` (overridable via `UPLOAD_DIR`). Local-disk only; not S3/blob storage (not in the agreed stack). |
+| [src/infra/celery_app.py](../services/api/src/infra/celery_app.py) | Complete (new) | `celery_app` (Redis-backed) + a genuinely-registered no-op `ingest_document` task. Producer-side only — `services/ingestion` gets its own instance in Phase 5, agreeing only by broker URL + task name, not shared code. |
+| [src/api/v1/routes/documents.py](../services/api/src/api/v1/routes/documents.py) | Complete (real logic) | `GET /documents` — every `Document` joined-loaded with `Company`, newest first, **not** filtered by `tenant.org_id` (deliberate — see decisions log: documents are shared reference data across orgs, not owned by one). `POST /documents` — real multipart upload (`UploadFile` + individual `Form(...)` fields), find-or-create `Company` by ticker, saves the PDF via `infra/storage.py`, writes a `Document` row (`status=pending`), enqueues the stub Celery task (failure to enqueue logs a warning, doesn't fail the request). |
+| [src/models/schemas/document.py](../services/api/src/models/schemas/document.py) | Updated | `DocumentCreateRequest` removed (replaced by individual route-level `Form(...)` params — a Pydantic submodel next to `File(...)` doesn't flatten the way a plain HTML form posts, confirmed by testing). Added `CompanyResponse` (nested on `DocumentResponse`) and `title`/`status` fields. |
+| [src/main.py](../services/api/src/main.py) | Updated | Added `CORSMiddleware` (outermost of all middleware), required for `Library.tsx`'s browser `fetch` calls — missing CORS was invisible to every non-browser check (`curl`, `mypy`, `ruff`, `pytest`) and only surfaced via an actual Playwright-driven browser run. Allowed origins default to Vite's dev ports, overridable via `CORS_ALLOWED_ORIGINS`. |
+| [pyproject.toml](../services/api/pyproject.toml) | Updated | Added `[[tool.mypy.overrides]]` for `celery.*` (`ignore_missing_imports = true`) — celery ships no type stubs/`py.typed` marker. |
+| [tests/unit/test_models.py](../services/api/tests/unit/test_models.py) | Updated | `_make_document_chunk`'s `Document(...)` construction now passes `title=` (newly required, not-null column) — 3/3 tests re-verified passing. |
+
+### services/api/ — Phase 2/3 output (unchanged this phase, re-verified)
+
+| Path | Status | Description |
+|------|--------|-------------|
+| [requirements.txt](../services/api/requirements.txt) | Complete (pre-work) | Unchanged; `python-multipart` (already present since Phase 2 pre-work) is what makes Phase 4's real file upload work with no new dependency. |
+| [alembic.ini](../services/api/alembic.ini) | Complete | Unchanged. |
+| [src/models/db/*.py](../services/api/src/models/db) (other 10 entity files + `base.py` + `__init__.py`) | Complete | Unchanged. |
+| [src/infra/db.py](../services/api/src/infra/db.py) | Complete | Unchanged. |
+| [src/api/v1/deps.py](../services/api/src/api/v1/deps.py), [src/api/middleware/*.py](../services/api/src/api/middleware) | Complete | Unchanged. |
+| [src/api/v1/routes/{query,conversations,citations,health,admin}.py](../services/api/src/api/v1/routes) | Complete (stub) | Unchanged — still Phase 3 placeholders; `documents.py` is the only route file with real logic so far. |
+
+### migrations/ (repo root)
+
+| Path | Status | Description |
+|------|--------|-------------|
+| [env.py](../migrations/env.py), [script.py.mako](../migrations/script.py.mako) | Complete | Unchanged. |
+| [versions/1366ef359569_initial_schema.py](../migrations/versions/1366ef359569_initial_schema.py) | Applied | Unchanged (Phase 2's initial schema). |
+| [versions/e0bad18df9c5_initial_schema.py](../migrations/versions/e0bad18df9c5_initial_schema.py) | Applied | Pre-existing empty/no-op migration found already chained onto the initial schema at the start of this phase (not created this phase) — harmless, left in place rather than rewriting migration history. |
+| [versions/8c520544e49c_add_document_title_and_status.py](../migrations/versions/8c520544e49c_add_document_title_and_status.py) | Applied (new) | Adds `documents.title`/`documents.status` + the `document_status` Postgres enum. Autogenerate's raw output was incomplete (missing an explicit `CREATE TYPE` for the new enum on an *existing* table — see decisions log) and was hand-corrected before applying. Verified: failed once cleanly (transactional DDL rolled back with zero partial state), fixed, re-ran successfully. |
+
+### scripts/ (repo root)
+
+| Path | Status | Description |
+|------|--------|-------------|
+| [seed_dev_data.py](../scripts/seed_dev_data.py) | Complete (new) | Loads 4 companies (NVDA/AMD/INTC/TSM) + 6 documents mirroring the old `MOCK_DOCS` data, idempotently (application-level check, not a DB constraint). Verified by running it twice: first run 6 created/0 skipped, second run 0 created/6 skipped. |
+
+### Everything else (unchanged this phase)
 
 | Area | Status |
 |------|--------|
-| `services/api` | Empty — no files at all. |
-| `services/ingestion` | Empty — no files at all. |
-| `packages/shared` | Empty — no files at all. |
-| `migrations` | Empty — no files at all. |
-| `infra/k8s`, `infra/terraform` | Empty — subdirectories exist, no files. |
-| `eval` | Empty — no files at all. |
-| `scripts` | Empty — no files at all. |
-| `.github/workflows` | Empty — directory exists, no workflow files. |
-| `docs` | Empty — no planning docs, no ER model doc, no architecture doc present anywhere in the repo. |
+| `services/ingestion` | Only `requirements.txt` + `venv/`. Zero application code. |
+| `packages/shared` | Empty. |
+| `infra/k8s`, `infra/terraform` | Empty. |
+| `eval` | Empty. |
+| `.github/workflows` | Empty. |
+| `docs` | `architecture.md` and `Financial_RAG_Project_Structure.md` unchanged this phase. |
+| `data/uploads/` | New, gitignored — where `POST /documents` actually writes uploaded PDFs locally. Empty in the committed tree; contains test-upload artifacts only transiently during manual verification (cleaned up after). |
 
 ## Known Issues / Bugs
 
-**Frontend known-issue checklist (from earlier review):**
+**Frontend known-issue checklist** — unchanged from the previous
+snapshot; see git history for the full table (unused shadcn components,
+disconnected dark-mode tokens on the shadcn `Dialog` primitive
+specifically confirmed still relevant this phase — see Deviations below
+— missing aria-labels, dead MUI/Emotion deps, `react`/`react-dom` as
+optional peerDeps, missing `tsconfig.json` — none fixed this phase,
+none newly introduced by it).
 
-| Issue | Status |
-|-------|--------|
-| SearchIcon/Search import mismatch crash in Chat.tsx | **Not Fixed** — [Chat.tsx:70](../frontend/src/app/pages/Chat.tsx#L70) renders `<Search .../>`; only `SearchIcon` (aliased) is imported at [Chat.tsx:230](../frontend/src/app/pages/Chat.tsx#L230). `Search` is undefined → crashes the empty-project Chat view. |
-| Unused shadcn/Radix components without escape/click-outside handling | **Not Fixed** — [Layout.tsx](../frontend/src/app/components/Layout.tsx) hand-rolls the project-switcher dropdown (~[L122-171](../frontend/src/app/components/Layout.tsx#L122-L171)) and the "new project" modal (~[L284-347](../frontend/src/app/components/Layout.tsx#L284-L347)) with plain `div`s instead of the installed `ui/dropdown-menu.tsx`/`ui/dialog.tsx`. Neither has an Escape-key handler or backdrop/outside-click-to-close. |
-| Disconnected dark mode tokens | **Not Fixed** — [theme.css](../frontend/src/styles/theme.css) defines a full `:root`/`.dark` token system, but every page/Layout hardcodes literal colors (`bg-[#0a0a0a]`, `text-zinc-400`, `border-zinc-800`, etc.) instead of the semantic `bg-background`/`text-foreground` classes. No `ThemeProvider`/toggle wired anywhere (`next-themes` is only used inside `ui/sonner.tsx`, not app-wide). |
-| Missing aria-labels on buttons | **Not Fixed** — grep for `aria-label` across `src/app` returns 5 hits, all inside the generic shadcn library files (`breadcrumb.tsx`, `pagination.tsx`, `sidebar.tsx`). Zero in the actual pages/Layout. Icon-only buttons with no label: citation-panel close ([Layout.tsx:252-257](../frontend/src/app/components/Layout.tsx#L252-L257)), new-project-modal close ([Layout.tsx:289-291](../frontend/src/app/components/Layout.tsx#L289-L291)), settings "button" (actually a bare `<Settings>` icon in a `div`, not even a real button — [Layout.tsx:236](../frontend/src/app/components/Layout.tsx#L236)), Library row actions (Download/MoreHorizontal — [Library.tsx:152-153](../frontend/src/app/pages/Library.tsx#L152-L153)). |
-| Dead MUI/Emotion dependencies still in package.json | **Not Fixed** — [package.json](../frontend/package.json) still lists `@mui/material`, `@mui/icons-material`, `@emotion/react`, `@emotion/styled`, `@popperjs/core`, `react-popper`. Grep for `@mui`/`@emotion`/`@popperjs`/`react-popper` under `src/` returns zero matches — confirmed unused. |
-| react/react-dom listed as optional peerDependencies | **Not Fixed** — [package.json:73-84](../frontend/package.json#L73) still has `react`/`react-dom` under `peerDependencies` with `peerDependenciesMeta.optional: true`, which is wrong for an app (not a library) and can silently produce a broken install. |
+**Phase 4-specific notes:**
+- `GET /documents` is **not** filtered by `tenant.org_id`, on purpose —
+  see `docs/DECISIONS_LOG.md`'s "Documents are shared reference data"
+  entry. If a future phase needs per-tenant visibility restrictions over
+  the shared corpus, that's a join table, not an `org_id` FK on
+  `Document`.
+- `POST /documents`'s company find-or-create has an accepted, unguarded
+  race on a brand-new ticker under concurrent requests (documented
+  in-code and in the decisions log) — fine for single-analyst local
+  dev/demo, not fine for a real multi-writer production path.
+- No `GET /companies` endpoint exists yet — `POST /documents` creates
+  companies implicitly via find-or-create; there's no way to list/browse
+  companies independently of their documents yet.
+- No `GET /documents/{id}/file` endpoint — the Library page's
+  Download/MoreHorizontal row actions remain inert placeholders, same as
+  the old mock (uploaded files are retrievable only by reading
+  `data/uploads/` directly, or via `Document.source_url`).
+- Local-disk file storage (`data/uploads/`) only works because
+  `services/api` and `services/ingestion` share a filesystem in local dev
+  — Phase 9 (deployment) needs a real shared object store instead.
+- `CORS_ALLOWED_ORIGINS` defaults cover Vite's default dev port (`5173`)
+  and `3000`; anyone running the frontend on a different port needs to
+  set this env var or `GET /documents` will fail in the browser with a
+  CORS error (not a 4xx/5xx — the request never completes from the
+  frontend's point of view).
 
-**Grep for TODO/FIXME/XXX/NotImplementedError/bare `pass`:** No matches anywhere in the repo (expected — there's no backend code yet to leave TODOs in).
-
-**Other issues noticed:**
-- No `tsconfig.json` in `frontend/` despite an all-TypeScript codebase.
-- `vite.config.ts`'s `figma:asset/` resolver points at `frontend/src/assets`, which does not exist.
-- Stray `Financial Research Intelligence Platform.zip` committed inside `frontend/`.
+**Grep for TODO/FIXME/XXX/NotImplementedError/bare `pass`:** No matches
+under `services/api/src` or `frontend/src/app/lib` (checked as part of
+this phase).
 
 ## Deviations From the Original Plan
 
-- **No planning docs in the repo at all.** The task brief references "the project structure doc" and "the architecture doc" under `docs/` — `docs/` is empty. Cannot diff the file tree against them; this section is based on the build order supplied out-of-band.
-- **No git repository.** `git` is not initialized (and not on PATH in this environment) — there is no commit history to build a timeline from, contradicting an implied "already has commits" starting state.
-- **Backend is 100% scaffolding-only.** Every non-frontend top-level directory (`services/api`, `services/ingestion`, `packages/shared`, `migrations`, `infra/*`, `eval`, `scripts`, `.github/workflows`) exists as an empty folder with no files — likely created as placeholders for the planned structure but never populated.
-- **Frontend is further along than the build order assumes.** Phase 1 (fix Search crash) and phase 3 (FastAPI skeleton) haven't happened, yet phase 4/7-equivalent UI (Library, Chat, Compare, Admin pages) already exists in full mock form — the frontend was scaffolded ahead of the backend, likely from an imported Figma "Make" export (`@figma/my-make-file` package name, leftover `.zip`) rather than built in the agreed sequence.
-- **Dependency bloat vs. plan:** MUI/Emotion/Popper packages present but entirely unused (app is Tailwind + Radix/shadcn), likely inherited wholesale from the Figma export rather than deliberately chosen.
+- **`GET /documents` deliberately does not implement literal
+  `tenant.org_id` row-filtering**, even though `PROJECT_HANDBOOK.md`'s
+  Phase 4 prompt says "scoped by tenant context." Surfaced explicitly as
+  an ER-model gap (`docs/architecture.md` §7 has no relationship between
+  `ORGANIZATION` and `COMPANY`/`DOCUMENT` at all) and resolved via an
+  explicit choice (shared corpus, no row filtering — SEC filings are
+  public data) rather than silently adding an `org_id` FK, which
+  `CLAUDE.md` §4 would have required flagging first anyway. Full
+  reasoning in `docs/DECISIONS_LOG.md`.
+- **`POST /documents`'s request shape is real multipart file upload with
+  individual `Form(...)` fields, not the Phase 3 stub's JSON body or a
+  Pydantic form-model.** A Pydantic model as `Form(...)` (FastAPI's own
+  documented pattern) was tried first and found, by live-testing, to nest
+  incorrectly when combined with a sibling `File(...)` param — switched to
+  one `Form(...)` parameter per field instead. See decisions log.
+- **`CORSMiddleware` added to `main.py`**, not part of any phase's
+  originally-planned file list — necessary the moment any frontend page
+  makes a real cross-origin browser `fetch` call, which first happens
+  this phase. Every non-browser check (`curl`, `mypy`, `ruff`, `pytest`)
+  passed without it; only caught via an actual Playwright-driven browser
+  run against the real dev server.
+- **Local-disk PDF storage (`services/api/src/infra/storage.py`,
+  `data/uploads/`)** is new, unplanned infrastructure — needed because
+  Phase 4's DoD requires an actual PDF upload to work, and nothing in the
+  agreed stack (`CLAUDE.md` §3) covers file storage yet. Explicitly
+  flagged as a Phase-9-must-revisit (real deployment needs a shared
+  object store, not a shared local filesystem).
+- Everything from the previous snapshot's deviations list (Phase 3's
+  health-check exception, the `ruff` bugbear config, `docs/architecture.md`
+  supplied mid-Phase-2, `DocumentChunk.chunk_index` added beyond the
+  pasted ER diagram, model-layer tests added a phase early, frontend
+  scaffolded ahead of backend) still stands and wasn't touched this
+  phase.
 
 ## Immediate Next Step
 
-Fix the `Search`/`SearchIcon` import crash in [Chat.tsx](../frontend/src/app/pages/Chat.tsx) (build-order phase 1) — it's a one-line fix and is currently the only blocker to the frontend mock even running without throwing.
+Phase 4 is done — the Library page is a real, verified vertical slice
+from browser click to Postgres row and back (and back again, rendered).
+Next up is **Phase 5: the ingestion pipeline** (`PROJECT_HANDBOOK.md` §6)
+— `services/ingestion/src/` still has zero application code. Phase 5
+needs to: implement `document_classifier.py`, `pdf_parser.py`,
+`layout_segmenter.py`, `table_extractor.py`, `agentic_chunker.py`/
+`table_chunker.py`, `embedder.py`, and `qdrant_writer.py`/
+`metadata_writer.py`, then wire all of it into a real
+`tasks/ingest_document.py` Celery task **registered under the same
+`"ingest_document"` task name** Phase 4's stub already uses in
+`services/api/src/infra/celery_app.py` — so anything already sitting in
+the Redis queue from Phase 4 testing/demo gets picked up with no rename.
+The real task should read the PDF from `Document.source_url` (a path
+under `data/uploads/`, written by Phase 4's `infra/storage.py`) and, on
+completion, flip `Document.status` from `PENDING` through `PROCESSING` to
+`COMPLETED`/`FAILED` — the enum already has all four values Phase 5
+needs, added proactively this phase. Nothing in Phase 5 is blocked; run
+the Celery worker with `--pool=solo` on Windows per `PROJECT_HANDBOOK.md`
+§5.

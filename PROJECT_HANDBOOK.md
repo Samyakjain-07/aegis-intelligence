@@ -252,7 +252,11 @@ working Alembic migration.
 
 **What gets built:** `services/api/src/models/db/{base,enums,organization,
 user,company,document,document_chunk,table_data,conversation,query,answer,
-citation,eval_result}.py`, plus the first Alembic migration.
+citation,eval_result}.py`, plus the first Alembic migration, plus
+`services/api/tests/unit/{conftest.py,test_models.py}` — model-layer tests
+now start in Phase 2 rather than first appearing in Phase 6 (see
+`docs/DECISIONS_LOG.md`'s entry for `tests/unit/conftest.py` +
+`test_models.py` for why).
 
 **Claude Code prompt:**
 > Implement the SQLAlchemy 2.0 models under `services/api/src/models/db/`

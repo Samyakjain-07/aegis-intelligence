@@ -41,3 +41,7 @@ scripts/**/*.tmp
 # Eval harness run outputs (RAGAS/DeepEval reports), not the gold Q&A set itself
 eval/results/
 eval/**/*.report.json
+
+# Locally-uploaded source PDFs (Phase 4) -- local-disk dev storage, not
+# meant to be committed; see services/api/src/infra/storage.py.
+/data/uploads/

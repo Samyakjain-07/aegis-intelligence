@@ -1,0 +1,27 @@
+[tool.ruff.lint.flake8-bugbear]
+# `Depends(...)` (and FastAPI's other `params` helpers) as a function
+# *default* is the framework's documented, required DI pattern -- not the
+# mutable-default-argument footgun B008 exists to catch. Without this,
+# every route in api/v1/routes/ trips B008. See docs/DECISIONS_LOG.md's
+# Phase 3 entry.
+extend-immutable-calls = ["fastapi.Depends", "fastapi.params.Depends"]
+
+[[tool.mypy.overrides]]
+# celery ships no py.typed marker / stub package, so mypy can't check
+# against its actual API shape -- this is a third-party gap, not something
+# fixable in this repo. Scoped to `celery.*` only (not a blanket
+# `ignore_missing_imports` for everything) so a real missing-stub problem
+# in a different dependency still fails loudly. First needed by
+# infra/celery_app.py (Phase 4, PROJECT_HANDBOOK.md); see docs/DECISIONS_LOG.md.
+module = ["celery.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+# Adds services/api itself (the directory this file lives in, i.e. "." when
+# pytest is invoked from services/api per PROJECT_HANDBOOK.md's Definition
+# of Done) to sys.path. Without this, pytest's default "prepend" import
+# mode adds tests/unit/ (the directory containing conftest.py, since
+# there's no __init__.py anywhere under tests/) to sys.path instead, and
+# `import src.models.db` inside the tests would fail with a ModuleNotFoundError.
+pythonpath = ["."]
+testpaths = ["tests"]
