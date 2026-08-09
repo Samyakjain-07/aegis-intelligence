@@ -1170,3 +1170,602 @@ fix; `services/api` itself needs to actually be started with
 (and every future page Phase 6/7 wires up through the same
 `lib/api.ts` client inherits this fix automatically, with no further
 per-page changes).
+
+---
+
+## [2026-08-09] Provider decisions: Cohere for embeddings, OpenAI for agentic chunking
+**Phase:** 5 — ingestion pipeline (setup)
+**What was built:** No code — a recorded decision, asked of Sam directly
+before writing `embedder.py` or `agentic_chunker.py`, since both are new
+external dependencies `CLAUDE.md` §4 requires stopping for.
+**Why this approach:** `.env.example`/the Phase 2 decisions-log entry both
+already flagged the embedding provider as explicitly undecided
+(`EMBEDDING_API_KEY` was a deliberate placeholder name), and no LLM vendor
+for "LLM-assisted" chunking was named anywhere in the docs at all — two
+genuine gaps, not two places to quietly pick a default. Asked as a single
+two-part question:
+- **Embeddings -> Cohere** (`embed-english-v3.0`, 1024-dim), not OpenAI or
+  local HuggingFace. Reuses the vendor/key/`cohere` dependency already
+  agreed for `services/api`'s reranker (`CLAUDE.md` §3) — one API
+  relationship covers both, instead of adding a second vendor on top of
+  Cohere for embeddings alone.
+- **Agentic chunking LLM -> OpenAI** chat completions (`gpt-4o-mini` by
+  default), not Anthropic or a heuristic-only placeholder. This is a
+  genuinely new vendor (`openai` added to `services/ingestion/
+  requirements.txt`, `OPENAI_API_KEY` added to `.env.example`) — accepted
+  as the cost of actually building the "LLM-assisted" chunking step
+  `PROJECT_HANDBOOK.md` names explicitly, rather than deferring it.
+**Key concepts a reviewer should understand:**
+- This is `CLAUDE.md` §4's stop-and-ask boundary working as intended: two
+  real architectural choices existed, neither was defensible to make
+  silently, and both were resolved by asking rather than by picking
+  "whatever's easiest to code."
+- The OpenAI dependency is *optional at runtime*, not just in principle:
+  `agentic_chunker.py` checks for `OPENAI_API_KEY` and falls back to a
+  deterministic heuristic splitter if it's absent or the call fails --
+  see that file's own decisions-log entry. Ingestion works end-to-end
+  with zero `OPENAI_API_KEY` set, confirmed by this phase's live smoke
+  test (real Postgres/Qdrant/Cohere, no OpenAI key in `.env`).
+**Tradeoffs / deliberately left out:** Two LLM vendors now exist in the
+stack (Cohere for rerank+embeddings, OpenAI for chunking) rather than
+one -- accepted because Cohere doesn't offer a general chat-completion
+API suited to structured JSON boundary detection the way its embed/rerank
+endpoints are purpose-built for search. Phase 6's `answer_generator.py`
+will need its own LLM-provider decision; this entry doesn't presume that
+one has to be OpenAI too, though reusing OpenAI would avoid a third
+vendor.
+**How it connects to the rest of the system:** Every other Phase 5 entry
+below that touches `embedder.py` or `agentic_chunker.py` assumes this
+decision without re-litigating it.
+
+---
+
+## [2026-08-09] Shared SourceLocation type (packages/shared)
+**Phase:** 5 — ingestion pipeline
+**What was built:** `packages/shared/aegis_shared/` -- a small, editable-
+installed Python package (`pip install -e ../../packages/shared`, wired
+into `services/ingestion/requirements.txt`) holding one dependency-free
+frozen dataclass, `SourceLocation` (`document_id`, `page_number`,
+`chunk_type`, `chunk_index`, `table_cell_ref`), with `exact_location()`,
+`to_qdrant_payload()`, and `from_qdrant_payload()`.
+**Why this approach:** `docs/architecture.md` §2 names the `source_location`
+concept -- "built once, at ingestion time, and travels unchanged ... into
+the final citation object" -- as the single most important design
+decision in the ingestion pipeline. Putting the *type* itself in
+`packages/shared` (named for exactly this purpose in `PROJECT_HANDBOOK.md`
+§4's repo structure map, unused until now) turns "unchanged" from a
+convention two independently-maintained copies have to keep agreeing on
+by hand into a fact about the code: `services/ingestion` constructs one
+instance per chunk today; Phase 6's `citation_resolver.py`
+(`services/api`) will import this exact class to read one back out of a
+retrieved Qdrant point.
+Packaged as a real installable local package (`pyproject.toml`,
+`setuptools` backend, `pip install -e`), not a copy-pasted file or a
+`sys.path` hack -- the standard, correct answer for genuinely shared code
+in a multi-service repo. `setuptools` over `hatchling` for the build
+backend: one fewer new build-tool dependency to fetch, no functional
+difference at this size.
+**Key concepts a reviewer should understand:**
+- Deliberately dependency-free (no SQLAlchemy, no service imports) --
+  this is the one thing to get right here, since anything heavier would
+  mean importing this package drags in whichever service's stack that
+  dependency belongs to.
+- `mypy` couldn't resolve the editable install by default -- modern
+  `setuptools` editable installs use an import-hook `MetaPathFinder`
+  (`__editable___aegis_shared_..._finder.py` in site-packages) that the
+  real Python interpreter follows at runtime but `mypy`'s static import
+  resolution doesn't. Fixed with `mypy_path = ["../../packages/shared"]`
+  in `services/ingestion/pyproject.toml`, pointing mypy at the real
+  source directly rather than through the install mechanism -- confirmed
+  necessary by reproducing the `import-not-found` error first, not
+  assumed.
+- A `py.typed` marker was added to `aegis_shared` on the same reasoning
+  as `docs/DECISIONS_LOG.md`'s existing celery-stub-gap entries: a
+  shared, typed library should declare itself typed so consumers' `mypy`
+  runs trust its signatures instead of treating it as untyped.
+**Tradeoffs / deliberately left out:** `services/api` does not yet
+install this package -- nothing there needs it until Phase 6's
+`citation_resolver.py`. Explicitly flagged in `docs/progress.md`'s
+"Immediate Next Step" so it isn't a surprise. Exact character-offset
+spans aren't tracked (`text_span` is chunk-ordinal, e.g. `"chunk 2"`, not
+a `(start, end)` pair) -- narrower than a citation system could ideally
+want, accepted for now since `agentic_chunker.py` doesn't track character
+offsets against the *original page text* either (its boundaries are
+relative to already-extracted narrative text, and the source PDF's exact
+text-layer offsets aren't preserved past `pdf_parser.py`).
+**How it connects to the rest of the system:** Constructed in
+`services/ingestion/src/tasks/ingest_document.py`, consumed by
+`src/storage/qdrant_writer.py` (`to_qdrant_payload()`). Nothing reads
+`from_qdrant_payload()` yet -- included now so Phase 6 has a symmetric
+read path already defined rather than guessed at later.
+
+---
+
+## [2026-08-09] services/ingestion's own mirrored ORM models + infra layer
+**Phase:** 5 — ingestion pipeline
+**What was built:** `services/ingestion/src/storage/models.py` (a second,
+independent set of SQLAlchemy 2.0 models -- `Company`, `Document`,
+`DocumentChunk`, `TableData`, plus mirrored `DocumentStatus`/`ChunkType`
+enums) and the ingestion-side infra layer: `src/infra/db.py` (engine/
+session, same shape as `services/api`'s), `src/infra/celery_app.py` (the
+consumer-side Celery app, `include=["src.tasks.ingest_document"]`), and
+`src/infra/storage.py` (`resolve_source_path`, the read-side counterpart
+to the API's `save_uploaded_pdf`).
+**Why this approach:** The one real architectural fork in this phase.
+`services/api/src/models/db/` already has full, working `Document`/
+`DocumentChunk`/`TableData` models -- the obvious-looking alternative was
+importing those directly from `services/ingestion`. Rejected, for three
+reasons: (1) `PROJECT_HANDBOOK.md` §6 Phase 5's file list is scoped
+entirely to `services/ingestion/src/`, not a refactor of already-migrated,
+already-tested Phase 2-4 files; (2) `services/api/src/infra/
+celery_app.py`'s own Phase 4 docstring already established the governing
+principle for this exact service pair -- "the two ... instances only ever
+agree by convention ..., never by sharing Python code" -- written for the
+Celery app but equally true for the ORM layer, since `docs/architecture.md`
+§3 calls the services "deliberately decoupled" specifically so they can
+scale independently, and a cross-service Python import would silently
+undo that (you could no longer ship an ingestion worker without the API's
+source tree present); (3) the actual point of agreement between the two
+model sets is the Postgres schema itself (table/column/enum-type names,
+created once by the API's Alembic migrations) -- not Python class
+identity.
+**Key concepts a reviewer should understand:**
+- Only the columns each writer/reader actually touches are declared here
+  -- no `relationship()`s, since this file only ever does Core-style
+  `select`/`insert ... on_conflict_do_update`/`update`, never ORM graph
+  navigation.
+- `PgEnum(DocumentStatus, name="document_status", create_type=False)` --
+  `create_type=False` stops SQLAlchemy from ever trying to `CREATE TYPE`
+  (the enum already exists from the API's migration); moot today since
+  nothing here calls `Base.metadata.create_all()`, but explicit rather
+  than relying on that never happening by accident.
+- `document_type` is mapped as a plain `String`, not a third enum
+  duplicate -- ingestion only ever *reads* this column (for
+  `document_classifier.py`'s mismatch check and Qdrant payload metadata),
+  never writes it, so a plain string read is simpler than mirroring an
+  enum this file has no reason to validate against.
+**Tradeoffs / deliberately left out:** Real coordination cost accepted:
+if the API's Alembic migrations ever rename/retype one of these columns,
+both model files need updating in lockstep, and nothing enforces that
+automatically. Judged cheaper than the cross-service import coupling it
+avoids, and consistent with a precedent this repo already set (the two
+`celery_app.py` files agreeing only by broker URL + task name).
+**How it connects to the rest of the system:** `src/storage/
+metadata_writer.py` is the only consumer of `models.py`. `src/infra/
+storage.py::resolve_source_path` is the first thing `tasks/
+ingest_document.py` calls after loading a `Document` row, turning its
+`source_url` into an openable path for `src/parsing/pdf_parser.py`.
+
+---
+
+## [2026-08-09] pdf_parser.py — pymupdf structural parse
+**Phase:** 5 — ingestion pipeline
+**What was built:** `services/ingestion/src/parsing/pdf_parser.py`'s
+`parse_pdf()`, returning a `ParsedDocument` of `ParsedPage`s, each with
+plain text, font-annotated `TextLine`s (size + bold, per span), and
+candidate table bounding boxes from pymupdf's own `Page.find_tables()`.
+**Why this approach:** Every downstream parsing/chunking stage consumes
+this module's output rather than touching `pymupdf` directly, so there's
+exactly one place in the codebase that knows how to walk a
+`pymupdf.Document`. Table-bbox detection lives here rather than in
+`layout_segmenter.py` (which conceptually "owns" the narrative/table/
+footnote split) because it needs the live `pymupdf.Page` object this
+module already has in scope while iterating -- `layout_segmenter.py`'s
+job is the classification logic that *consumes* these bboxes, not
+re-deriving pymupdf primitives a second time.
+**Key concepts a reviewer should understand:**
+- Font "flags" is a bitmask (bit 4 = bold) -- pymupdf's own documented
+  span format, not something invented here.
+- `find_tables()` is wrapped in a broad `try/except`: it's a heuristic
+  detector known to raise on some malformed content streams, and a
+  detection failure should degrade to "no table candidates on this page"
+  (narrative text still extracts normally), not abort the whole document
+  -- consistent with `docs/architecture.md` §3's failure-path philosophy
+  of degrading gracefully rather than hard-failing on a non-fatal step.
+- Imports `pymupdf`, not the deprecated `fitz` alias -- confirmed via the
+  installed version's own deprecation warning before writing any code
+  against it.
+**Tradeoffs / deliberately left out:** `find_tables()` is only a fast
+*candidate* detector, not the final table extraction -- confirmed
+correct in this phase's live smoke test (it flagged exactly the one page
+with a real ruled table in the synthetic test PDF, no false positives on
+the two text-only pages). The authoritative structured extraction is
+camelot (`table_extractor.py`), deliberately slower and run only against
+these candidate pages.
+**How it connects to the rest of the system:** Called first, inside
+`tasks/ingest_document.py`, before classification, segmentation, or table
+extraction -- every other parsing-stage module takes a `ParsedDocument`
+(or a page from one) as input.
+
+---
+
+## [2026-08-09] document_classifier.py — heuristic filing/transcript/deck classification
+**Phase:** 5 — ingestion pipeline
+**What was built:** `services/ingestion/src/parsing/document_classifier.py`.
+`classify_document()` scores a `ParsedDocument`'s first 5 pages against
+regex/keyword signal sets for `FILING`/`TRANSCRIPT`/`DECK` (plus a
+sparse-text-per-page signal for decks), returning the highest-scoring
+`DocumentKind` and a normalized confidence; `UNKNOWN` when no signal
+fires at all. `matches_declared_type()` maps a `DocumentKind` back to the
+`Document.document_type` string(s) it should agree with, used by
+`tasks/ingest_document.py` to log (not enforce) a mismatch against what
+the analyst picked at upload time.
+**Why this approach:** Pure heuristics, no LLM -- unlike
+`agentic_chunker.py`, nothing in `PROJECT_HANDBOOK.md`'s Phase 5 prompt
+calls this stage "LLM-assisted," and a three-way document-shape
+classification (a filing has "PART I"/"Item 7."-style section markers, a
+transcript has "Operator:"/speaker-line patterns, a deck is sparse and
+says "forward-looking statements") is squarely the kind of thing
+regex/keyword scoring handles reliably and for free, matching
+`docs/architecture.md` §1 step 2's "classify document type" without
+adding a third LLM call to the pipeline.
+Deliberately independent of the API's `DocumentType` enum (no import) --
+`matches_declared_type` compares against plain string values instead, for
+the same decoupling reason `src/storage/models.py` gives for not
+importing the API's ORM models.
+**Key concepts a reviewer should understand:**
+- Confidence is `winning_score / total_score` across all three kinds --
+  a cheap, honest signal-strength measure, not a calibrated probability.
+- The deck "sparse text" bonus is guarded on non-empty sample text (`if
+  sample_text.strip() and words_per_page < threshold`) -- caught by this
+  phase's own unit tests: an *empty* document also has 0 words/page, but
+  that's absence of evidence, not evidence of a sparse slide deck, and
+  should fall through to `UNKNOWN`, not get misclassified as `DECK`.
+- Live smoke-tested against two real documents: a synthetic 10-K-style
+  PDF (correctly classified `FILING`, confidence 0.83) and an unrelated
+  real PDF already sitting in `data/uploads/` from Phase 4 testing (a
+  health-NLP paper, correctly landing on `UNKNOWN` rather than being
+  forced into one of the three real kinds).
+**Tradeoffs / deliberately left out:** A mismatch between the classified
+kind and the analyst's declared `document_type` is only logged
+(`tasks/ingest_document.py`), never blocks ingestion or overrides the
+analyst's choice -- `docs/architecture.md` §3's decision table describes
+a "manual-review queue" for repeated classification failures, which
+doesn't exist yet as infrastructure; a warning log line is the honest
+current substitute, flagged here rather than silently claimed as done.
+**How it connects to the rest of the system:** Runs once per document in
+`tasks/ingest_document.py`, right after `parse_pdf()`; its result is
+logged for observability but doesn't currently branch any downstream
+parsing behavior (segmentation/extraction run the same way regardless of
+classified kind).
+
+---
+
+## [2026-08-09] layout_segmenter.py — narrative/table/footnote split
+**Phase:** 5 — ingestion pipeline
+**What was built:** `services/ingestion/src/parsing/layout_segmenter.py`.
+`segment_page()` walks a `ParsedPage`'s font-annotated lines and buckets
+each into narrative text, footnote text, or "belongs to a table" (dropped
+from both, left for `table_extractor.py`), using per-page-median body
+font size, a bottom-quartile position check, and a leading footnote-marker
+regex (`"(1)"`, `"*"`, `"1."`).
+**Why this approach:** This is `docs/architecture.md` §1 step 3, called
+out there as "the step that matters most for accuracy" -- a table's text
+leaking into a narrative chunk (or vice versa) is exactly the kind of
+silent corruption that later causes a wrong number to look plausible.
+Font size is computed *per page*, not as a fixed point size, since body
+text size varies across filings/decks/transcripts; a marker-prefixed line
+is treated as a footnote regardless of position/size, since SEC filings
+sometimes place a footnote-marked line above the bottom-quartile cutoff
+this heuristic would otherwise require.
+**Key concepts a reviewer should understand:**
+- Table-region exclusion is a genuine bbox-overlap check
+  (`_overlaps`) against `pdf_parser.py`'s `find_tables()` output, not a
+  page-level "is this a table page, skip everything" flag -- a table page
+  can (and did, in this phase's synthetic test PDF) still have narrative
+  text above the table that correctly survives into `narrative_text`.
+- Confirmed against a live example, not just unit tests: this phase's
+  synthetic test PDF's page 3 has both an MD&A intro sentence and a ruled
+  table; the segmenter kept the sentence in `narrative_text` and excluded
+  every table cell's text from both `narrative_text` and `footnote_text`.
+**Tradeoffs / deliberately left out:** Footnote detection is a two-signal
+heuristic (small+bottom, or marker-prefixed) with no ground truth to
+tune thresholds against yet -- `_FOOTNOTE_SIZE_RATIO`/`_FOOTNOTE_Y_RATIO`
+are reasonable defaults, not values validated against a labeled dataset.
+Worth revisiting once Phase 8's eval harness exists and could measure
+whether footnote/narrative misclassification actually affects retrieval
+precision.
+**How it connects to the rest of the system:** Consumes `pdf_parser.py`'s
+output; produces `PageSegments`/`DocumentSegments`, which
+`table_extractor.py` (via `table_page_numbers`), `agentic_chunker.py`
+(narrative + footnote text per page), and `tasks/ingest_document.py` all
+read from directly.
+
+---
+
+## [2026-08-09] table_extractor.py — camelot structured extraction with lattice/stream fallback
+**Phase:** 5 — ingestion pipeline
+**What was built:** `services/ingestion/src/parsing/table_extractor.py`.
+`extract_tables()` runs camelot's `flavor="lattice"` parser against only
+the pages `layout_segmenter.py` flagged as table candidates; any table
+scoring below `_MIN_ACCURACY` (camelot's own 0-100 `parsing_report`
+score) is dropped and that page retried with `flavor="stream"` instead.
+Returns `ExtractedTable`s with `headers`/`rows` as separate lists.
+**Why this approach:** Direct implementation of `docs/architecture.md`
+§1 step 4 -- "never flatten a table into prose." Scoping camelot to
+candidate pages only (not the whole document) is a deliberate cost
+control: camelot re-renders/re-parses the PDF itself and is markedly
+slower than pymupdf's own `find_tables()` pre-filter. Lattice-first
+because SEC filings' financial tables are typically ruled; stream as a
+targeted retry (only for pages where lattice scored low), not a second
+full pass over every candidate page, since stream is the more
+expensive/less precise parser for tables that *do* have ruling.
+**Key concepts a reviewer should understand:**
+- `table.accuracy < _MIN_ACCURACY`, not an exception, is the fallback
+  trigger -- lattice silently produces low-confidence garbage on
+  borderless tables rather than raising, so accuracy score is the only
+  reliable signal that a retry is warranted.
+- `table.order` (camelot's own 1-based per-page rank) becomes
+  `table_index` (0-based) directly -- no separate per-page counter
+  invented here, reusing what camelot already computes.
+- Verified with the installed `camelot-py` 2.0 (a newer rewrite, not the
+  legacy 0.x/1.x API `PROJECT_HANDBOOK.md`'s `camelot-py[cv]>=0.11` pin
+  predates) via direct introspection of `camelot.io.read_pdf` and
+  `camelot.core.Table` before writing any code against it, and live
+  smoke-tested: correctly extracted a 4-row x 5-column ruled table from
+  this phase's synthetic test PDF with headers and every cell value
+  matching exactly.
+**Tradeoffs / deliberately left out:** No `flavor="ml"` (Table
+Transformer-based structure recognition, mentioned in `camelot-py` 2.0's
+own docs) -- requires an optional heavier ML dependency
+(`camelot-py[ml]`) not evaluated for this project; lattice/stream cover
+the common ruled/borderless cases financial filings mostly use.
+**How it connects to the rest of the system:** Called once per document
+in `tasks/ingest_document.py`, after `layout_segmenter.py`; its output
+feeds directly into `table_chunker.py`.
+
+---
+
+## [2026-08-09] agentic_chunker.py — LLM-assisted section boundaries with heuristic fallback
+**Phase:** 5 — ingestion pipeline
+**What was built:** `services/ingestion/src/chunking/agentic_chunker.py`.
+`chunk_narrative_page()` asks OpenAI (`gpt-4o-mini`, JSON-mode, one call
+per page under ~6000 chars) to identify logical section boundaries in a
+page's narrative text; falls back to a deterministic paragraph-boundary
+splitter (`_heuristic_section_boundaries`) if no `OPENAI_API_KEY` is set,
+the call fails, or the response is malformed/overlapping. Both paths run
+through `_enforce_size_bounds`, which merges undersized pieces forward
+(`_merge_small_boundaries`) and hard-splits oversized ones on whitespace,
+so every chunk downstream gets the same size guarantee regardless of
+which path produced it. `build_footnote_chunks()` (no LLM) turns a
+page's footnote text into one chunk.
+**Why this approach:** This is `docs/architecture.md` §1 step 5, and the
+one stage the handbook explicitly names "LLM-assisted." The fallback is a
+deliberate deviation from treating every external-service failure the
+same way: `docs/architecture.md` §3's failure-path table doesn't cover
+this stage specifically (only embedding and rerank), and section
+boundaries are a *quality* concern, not a *correctness* one the way a
+wrong number is -- a paragraph-boundary-chunked document is still fully
+retrievable and citable, just with less semantically clean edges. Failing
+the whole ingestion job over that would be a worse tradeoff than
+degrading gracefully, and this phase's live smoke test ran the entire
+pipeline through the heuristic path exclusively (no `OPENAI_API_KEY` set
+in `.env`) with zero ingestion failures.
+**Key concepts a reviewer should understand:**
+- `_merge_small_boundaries` is a forward-accumulating pass (accumulate
+  into `pending` until it reaches `_MIN_CHARS_PER_CHUNK`, then flush), not
+  a simple "merge into the previous entry" -- a naive backward-merge
+  fails on a small *leading* boundary (nothing earlier to merge into
+  yet); this was caught by this phase's own unit tests
+  (`test_enforce_size_bounds_merges_slivers`), not assumed correct.
+- The whitespace-split boundary is `whitespace + 1` (keeping the space as
+  the trailing character of the earlier piece), not the space's own
+  index -- otherwise every split-off chunk after the first would start
+  with a leading space. Also caught by a failing unit test before being
+  fixed.
+- LLM section boundaries are validated strictly (`start < cursor`, `end
+  <= start`, `end > len(text)` all rejected) before being trusted --
+  a malformed or overlapping response falls back to the heuristic path
+  rather than being used as-is.
+**Tradeoffs / deliberately left out:** No character-offset tracking back
+to the original PDF page (see `packages/shared`'s `SourceLocation` entry
+for the downstream consequence). A page whose narrative text exceeds
+~6000 chars skips the LLM call entirely rather than truncating/chunking
+the LLM input itself -- simpler, and avoids an LLM call reasoning about
+a boundary near an arbitrary truncation point.
+**How it connects to the rest of the system:** Called once per page in
+`tasks/ingest_document.py`'s chunk-building loop; `chunk_index` is *not*
+assigned here (see that file's docstring for why it's the orchestrator's
+job, not each chunker's).
+
+---
+
+## [2026-08-09] table_chunker.py — row-aligned table chunking
+**Phase:** 5 — ingestion pipeline
+**What was built:** `services/ingestion/src/chunking/table_chunker.py`.
+`chunk_table()` returns one `TableChunkDraft` per `ExtractedTable` in the
+common case; tables over `_MAX_ROWS_PER_CHUNK` (60) rows split into
+consecutive whole-row groups, header repeated in each. `_embedding_text()`
+renders a compact headers+sample-rows string used *only* as Cohere's
+embedding input.
+**Why this approach:** "Never split mid-row" is easy to satisfy trivially
+if no test table is ever large enough to force a split -- this phase's
+`tests/unit/test_table_chunker.py` specifically builds a 127-row table
+and asserts the reassembled rows match the original exactly and every
+split boundary falls between rows, not inside one, so the guarantee is
+verified, not just asserted in a docstring.
+**Key concepts a reviewer should understand:**
+- `_embedding_text()`'s flattened rendering does **not** violate "never
+  flatten a table" (`docs/architecture.md` §1 step 4) -- that requirement
+  governs the *stored* representation (`TableData.raw_table_json` /
+  Qdrant's structured payload fields), not a disposable string generated
+  purely because Cohere's embed API needs *some* text input and can't
+  embed JSON meaningfully. Verified live: this phase's smoke-tested table
+  chunk stored the full structured `{"headers": [...], "rows": [...]}}`
+  in Postgres exactly as authored, while its embedding input was the
+  separate flattened summary.
+- Split parts of one large table keep the same `table_index` (they're
+  fragments of one logical table, not distinct tables) -- what keeps
+  their `DocumentChunk` rows distinct is `chunk_index`, assigned by the
+  orchestrator, not `table_index`.
+**Tradeoffs / deliberately left out:** `_embedding_text` only samples the
+first 5 rows for large tables' embedding input -- a semantic search
+matching against row 40 of a 100-row table would rely on the header/
+early-row context rather than that row's own text. Acceptable for now
+since the full data is always retrievable via `raw_table_json` once the
+chunk is found by any means (including a narrative reference nearby);
+revisit if Phase 8's eval surfaces this as a real recall gap.
+**How it connects to the rest of the system:** Called once per document
+in `tasks/ingest_document.py`, after `table_extractor.py`; its
+`TableChunkDraft`s feed both `embedder.py` (via `.content`) and
+`metadata_writer.py`/`qdrant_writer.py` (via `.raw_table_json`).
+
+---
+
+## [2026-08-09] embedder.py — Cohere embeddings for narrative and table chunks
+**Phase:** 5 — ingestion pipeline
+**What was built:** `services/ingestion/src/embedding/embedder.py`.
+`embed_texts()` batches (96 at a time) through Cohere's `ClientV2.embed`
+(`embed-english-v3.0`, `embedding_types=["float"]`), preserving input
+order, with `input_type` required (`"search_document"` at ingestion time;
+`"search_query"` reserved for Phase 6's query-time embed call).
+**Why this approach:** See the earlier "Provider decisions" entry for why
+Cohere over OpenAI/local HuggingFace. Batches of 96 respect Cohere's
+embed-v3 per-call text limit without the caller (`tasks/ingest_document.py`)
+needing to know that limit exists. Raises on API failure rather than
+degrading, unlike `agentic_chunker.py`'s LLM call -- there is no
+meaningful fallback for a missing embedding (a chunk written to Postgres
+without a matching Qdrant vector is permanently unretrievable), matching
+`docs/architecture.md` §3's "if the provider is down, fail the ingestion
+job cleanly (don't partially embed)" failure path exactly.
+**Key concepts a reviewer should understand:**
+- `input_type` is not cosmetic -- Cohere's v3 embed models are trained
+  with different instruction prefixes per `input_type`, and using the
+  wrong one measurably hurts retrieval quality. Verified the exact
+  response shape (`response.embeddings.float_`) by reading the installed
+  `cohere` 7.x SDK's generated types directly rather than assuming the
+  v5-era API shape `PROJECT_HANDBOOK.md`'s `cohere>=5.5` pin predates.
+- `EMBEDDING_DIMENSION = 1024` is a fixed constant matching
+  `embed-english-v3.0`'s known output size, not derived at runtime from
+  a live API call -- `qdrant_writer.py`'s `ensure_collection()` uses it
+  as the default `vector_size` when creating the collection.
+**Tradeoffs / deliberately left out:** No retry/backoff wrapper around
+the Cohere call itself (unlike the Celery task's own
+`autoretry_for`/`retry_backoff`, which covers this at the task level --
+an embedding failure here propagates up and the whole task retries, not
+just the embed step). Simpler, and the live smoke test's real Cohere
+calls (62 texts across two real documents processed this phase) never
+exercised a transient-failure path to validate a finer-grained retry
+would even help.
+**How it connects to the rest of the system:** Called once per document
+in `tasks/ingest_document.py`, in a single batched pass over every
+chunk's draft content, before any Qdrant/Postgres writes begin.
+
+---
+
+## [2026-08-09] qdrant_writer.py + metadata_writer.py — the two storage writes
+**Phase:** 5 — ingestion pipeline
+**What was built:** `services/ingestion/src/storage/qdrant_writer.py`
+(`ensure_collection()`, `upsert_chunk_vector()`) and `src/storage/
+metadata_writer.py` (`load_document_context()`, `set_document_status()`,
+`upsert_document_chunk()`, `upsert_table_data()`,
+`set_embedding_vector_id()`) -- the vector-DB and relational-DB halves of
+`docs/architecture.md` §1 step 7.
+**Why this approach:** Idempotency (`docs/architecture.md` §2:
+"re-running ingestion on the same document should overwrite, not
+duplicate") is implemented as real `INSERT ... ON CONFLICT DO UPDATE`
+statements on `document_chunks` (document_id, page_number, chunk_index)
+and `table_data` (chunk_id) -- not an application-level "check then
+insert" (which has a race) or a "delete all chunks for this document,
+then reinsert" (which would generate new `chunk_id`s every re-run,
+breaking Qdrant point-ID continuity and any citation already pointing at
+the old ID). `document_chunks.chunk_id` is deliberately left out of every
+UPDATE's `SET` clause so a re-ingested chunk keeps its original identity.
+`qdrant_writer.upsert_chunk_vector` uses the chunk's own `chunk_id` (UUID
+string) as the Qdrant point ID directly -- `DocumentChunk.embedding_vector_id`
+and a Qdrant point's `id` are the same value *by construction*, never by
+a separate lookup that could drift.
+**Key concepts a reviewer should understand:**
+- `set_document_status` is a plain `UPDATE`, not an upsert -- the
+  `Document` row always already exists by the time ingestion runs
+  (`POST /documents` is the only thing that ever creates one), so there's
+  never a real conflict case, and an upsert would need every other NOT
+  NULL column supplied just to satisfy a row-construction path that can
+  never actually be taken.
+- `ensure_collection()` also creates Qdrant payload indexes
+  (`loc_document_id`, `ticker`, `document_type`, `loc_chunk_type`,
+  `fiscal_year`, `fiscal_quarter`) -- the concrete delivery on
+  `PROJECT_HANDBOOK.md` §2's stated reason for choosing Qdrant ("strong
+  native metadata filtering ... alongside vector search"), verified live
+  this phase: filtering the collection by `loc_document_id` returned
+  exactly the 31 points that document's chunks produced, matching
+  Postgres's own count exactly.
+- `upsert_chunk_vector` uses `wait=True` -- ingestion is an offline batch
+  job, not latency-sensitive, so it's worth blocking until Qdrant
+  confirms the write before Postgres records `embedding_vector_id`;
+  otherwise a crash between the two writes could leave a `DocumentChunk`
+  pointing at a vector that was never actually written.
+**Tradeoffs / deliberately left out:** No batched Qdrant upsert (one
+`client.upsert()` call per chunk, not one call for the whole document) --
+simpler control flow (each chunk's Postgres write and Qdrant write happen
+together, in the same loop iteration, so a mid-document crash leaves
+clearly-defined "done" vs. "not yet" chunks) at the cost of more HTTP
+round-trips; not a problem at this project's document-count scale, worth
+revisiting if ingestion throughput ever becomes a bottleneck.
+**How it connects to the rest of the system:** Both are called from
+`tasks/ingest_document.py`'s per-chunk write loop, immediately after
+`SourceLocation` is constructed for that chunk.
+
+---
+
+## [2026-08-09] tasks/ingest_document.py — the real Celery task, replacing Phase 4's no-op
+**Phase:** 5 — ingestion pipeline (wiring)
+**What was built:** `services/ingestion/src/tasks/ingest_document.py`'s
+`ingest_document` task, registered under the same `"ingest_document"`
+name as Phase 4's API-side stub. Orchestrates every stage above in order,
+assigns each chunk's `chunk_index` (one running counter per page, shared
+across narrative/footnote/table chunk types -- the orchestrator is the
+only place that sees all three streams merged), builds each chunk's
+`SourceLocation` exactly once, and drives `Document.status` through
+`PENDING -> PROCESSING -> COMPLETED`/`FAILED`. Uses `autoretry_for`,
+`retry_backoff`, and a custom `_StatusTrackingTask.on_failure` so `FAILED`
+is only set once Celery has genuinely exhausted retries, not on every
+transient attempt.
+**Why this approach:** Every chunk's draft content is built (parsing,
+segmenting, table extraction, chunking) and embedded in one batched pass
+*before* any Postgres/Qdrant write begins -- keeps the two network-bound
+external calls (OpenAI, Cohere) out of the write transaction, and means a
+failure before that point (a corrupt PDF, an embedding API outage) has
+written nothing partial to clean up. `on_failure` (not the task body's
+`except` block) is what sets `FAILED`, specifically so the status stays
+`PROCESSING` through transient retries -- a Library-page user watching the
+status badge sees "Processing" the whole time a retry/backoff cycle runs,
+not a flicker back to a stale `FAILED` between attempts.
+**Key concepts a reviewer should understand:**
+- Task name compatibility with Phase 4's stub was verified *live*, not
+  just by matching the string: this phase's smoke test started the real
+  worker and it immediately picked up and correctly processed a genuine
+  message left in Redis from Phase 4 testing (`document_id=5ff8c29a...`,
+  a real PDF uploaded weeks earlier) -- 31 chunks (21 narrative, 4 table,
+  6 footnote), 4 tables, all 31 with `embedding_vector_id` populated,
+  status flipped `PENDING -> PROCESSING -> COMPLETED`, with zero rename
+  or migration needed.
+- The retry/backoff/dead-letter path was also verified live and
+  unplanned: a second stale queued message referenced a `document_id`
+  that no longer exists in Postgres (a deleted/uncommitted test row from
+  before this phase). The task retried 3 times with the configured
+  exponential backoff (1s, 2s, 3s, matching `docs/architecture.md` §3's
+  "retry queue with exponential backoff"), then gave up cleanly --
+  `on_failure` ran, attempted to mark that (nonexistent) document
+  `FAILED` via a plain `UPDATE` affecting zero rows (not an error), and
+  the worker kept running normally afterward. No dead-letter *queue*
+  exists (Redis, unlike RabbitMQ, doesn't give one for free) -- the
+  `FAILED` Postgres status is the alert surface for now, an accepted gap
+  flagged here rather than silently claimed as complete.
+- `zip(chunk_specs, embeddings, strict=True)` -- deliberately fails loudly
+  if the embedding count ever doesn't match the chunk-spec count, rather
+  than silently misaligning a chunk with the wrong vector.
+**Tradeoffs / deliberately left out:** `autoretry_for=(Exception,)`
+doesn't distinguish retryable failures (a transient Cohere/OpenAI
+timeout) from deterministic ones (a genuinely corrupt PDF, a code bug) --
+both get the same 3-retry treatment, which is consistent with
+`docs/architecture.md` §3's stated behavior for "corrupt or unparseable
+PDF" but means a deterministic bug wastes ~3 retry cycles before
+surfacing as `FAILED` instead of failing fast. Worth narrowing to
+specific exception types if this becomes noisy in practice.
+**How it connects to the rest of the system:** The single integration
+point every other Phase 5 module was built to be called from. Upstream:
+enqueued by `services/api`'s `POST /documents` (Phase 4, unchanged this
+phase). Downstream: nothing yet reads its output -- Phase 6's retrieval
+pipeline is the first consumer of the `DocumentChunk`/`TableData`/Qdrant
+data this task produces.

@@ -1,0 +1,24 @@
+[tool.mypy]
+# packages/shared is installed editable (`-e ../../packages/shared`, see
+# requirements.txt) via setuptools' modern import-hook-based editable
+# mode, which mypy's static import resolution doesn't follow the same way
+# the real interpreter does at runtime (confirmed: `python -c "import
+# aegis_shared"` works fine; bare `mypy src` reported import-not-found
+# until this was added). Pointing mypy_path at the real source directory
+# sidesteps that gap without weakening the editable install itself.
+mypy_path = ["../../packages/shared"]
+
+[[tool.mypy.overrides]]
+# celery ships no py.typed marker / stub package, same gap flagged in
+# services/api/pyproject.toml's Phase 4 entry -- camelot, cohere, openai,
+# qdrant_client, and pymupdf all ship real py.typed markers (verified
+# before writing this file) and need no override.
+module = ["celery.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+# Same reasoning as services/api/pyproject.toml: adds services/ingestion
+# itself to sys.path so `import src...` resolves when pytest is invoked
+# from services/ingestion (PROJECT_HANDBOOK.md's convention).
+pythonpath = ["."]
+testpaths = ["tests"]

@@ -14,8 +14,16 @@ sqlalchemy>=2.0
 psycopg2-binary>=2.9
 qdrant-client>=1.9
 cohere>=5.5
+openai>=1.50
 pydantic-settings>=2.3
 python-dotenv>=1.0
 pytest>=8.2
 mypy>=1.10
 ruff>=0.5
+
+# Phase 5 (PROJECT_HANDBOOK.md): packages/shared, editable-installed.
+# Relative to this file's directory (services/ingestion, the cwd
+# PROJECT_HANDBOOK.md §5.3's `pip install -r requirements.txt` is always
+# run from). Not a PyPI package, so no version pin; see
+# packages/shared/pyproject.toml.
+-e ../../packages/shared
