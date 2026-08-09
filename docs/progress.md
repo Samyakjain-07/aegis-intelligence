@@ -1,31 +1,54 @@
-# Progress Snapshot — 2026-08-09 (Phase 5)
+# Progress Snapshot — 2026-08-09 (Phase 6)
 
-> Repo state check: real git repository (`git log` shows one prior
-> commit, `f80737c chore: initial commit`, plus an uncommitted Phase 4
-> tree at the start of this phase). Verified by reading files and
-> running each phase's own commands — `mypy`, `ruff`, and `pytest`
-> (24/24 new unit tests, all passing) inside `services/ingestion`'s own
-> venv, a real `pip install -e packages/shared` into that venv, and a
-> **live end-to-end run against the real Docker infra**: Postgres,
-> Qdrant, and Redis were already running (`docker compose ps`, confirmed
-> healthy before starting anything). A real `uvicorn` (port 8001) and a
-> real `celery -A src.infra.celery_app worker --pool=solo` were started;
-> a synthetic 10-K-style PDF was generated (`pymupdf`, three pages: cover
-> + narrative, risk-factors narrative + a footnote, MD&A narrative + a
-> ruled 4-row financial table) and uploaded through a real multipart
-> `POST /documents`. The worker picked it up and produced exactly the
-> expected chunks — verified by reading the actual rows back out of
-> Postgres and Qdrant, not just checking the task returned success (see
-> the Phase 5 row below and `docs/DECISIONS_LOG.md`'s `tasks/
-> ingest_document.py` entry for the full breakdown). Unplanned but
-> instructive: the same worker also picked up two *stale* messages
-> already sitting in Redis from Phase 4 testing — one a real document
-> that processed successfully end-to-end (31 chunks, 4 tables), one a
-> deleted test row that correctly retried 3x with exponential backoff
-> then failed cleanly, confirming the retry/failure path live, not just
-> in theory. Both background processes were stopped after verification;
-> the Postgres/Qdrant/Redis containers were left running (untouched,
-> pre-existing). Not verified by folder existence at any point.
+> Repo state check: real git repository (`git log` shows
+> `f80737c chore: initial commit` then `5f78d76 feat: Phase 4 ...`, plus
+> an uncommitted Phase 5 + Phase 6 tree at the start of this phase).
+> Verified by reading files and running each phase's own commands —
+> `mypy` (55 source files, zero errors) and `ruff` (zero errors) inside
+> `services/api`'s own venv, all 3 existing unit tests still passing,
+> and a **live end-to-end run against real Docker infra and real
+> ingested data**, not a synthetic fixture: Postgres/Qdrant/Redis were
+> already running and healthy (`docker compose ps`); a real `uvicorn`
+> (port 8001) was started against the same Postgres Phase 5 left real
+> chunks in — including a genuine downloaded SEC 10-K (Energy Services
+> of America Corporation, 284 real chunks across 132 pages, present at
+> the repo root, untracked) alongside Phase 5's synthetic Acme Robotics
+> test filing (5 chunks, one real 4-row financial table). `POST /query`
+> and `POST /query/followup` were exercised directly (`curl`) with real
+> Cohere calls (`COHERE_API_KEY` is configured in this environment) for
+> embedding, hybrid retrieval, and rerank. This snapshot spans **two**
+> live verification passes: the first with no `OPENAI_API_KEY`
+> configured (every generation/reformulation/expansion call ran its
+> documented no-key fallback path — confirmed working), the second after
+> Sam added a real key, exercising the actual LLM-backed path for the
+> first time. That second pass caught a real bug on its very first
+> LLM-generated answer — `numeric_verifier.py` never scanned text after
+> the *last* citation marker, so a model-computed, uncited figure
+> ("... $171.3M [1] ... $120.4M [1] ... an increase of $50.9M.") sailed
+> through unverified at 0.93 confidence — fixed the same session (see
+> `docs/DECISIONS_LOG.md`'s bugfix entry) and re-verified live: the
+> identical query now correctly returns confidence 0.23,
+> `low_confidence: true`. A numeric question against the Acme table
+> (`"What was Acme Robotics data center segment revenue in Q4 2025?"`)
+> came back with the exact source figure ($171.3M), a citation resolved
+> to `p.3 (table 0)` (reconstructed from Qdrant's payload, not
+> re-derived), and confidence 0.90 (no-key pass); a vague,
+> un-reformulated follow-up correctly scored low confidence (0.32)
+> instead of confidently guessing; a nonsense out-of-corpus query
+> correctly scored near-zero (0.02) without needing a hard pre-generation
+> block; and, after the key was added, a real history-aware follow-up
+> ("What about their logistics segment?") correctly reformulated to "What
+> was Acme Robotics logistics segment revenue in Q4 2025?" and answered
+> correctly at 0.86 confidence. The frontend was verified (before the key
+> was added) with a real headless-browser run (Playwright, driven via a
+> one-off scratch script — no `chromium-cli`/project run-skill exists yet
+> for this repo) against a real `npm run dev` server and the same live
+> API: screenshots confirm a typed question, a rendered answer with live
+> citation badges, and the citation side panel showing the correct
+> document/page and an extract matching the source table exactly. All
+> background processes were stopped after verification; the Postgres/
+> Qdrant/Redis containers were left running (untouched, pre-existing).
+> Not verified by folder existence at any point.
 
 ## Build Order Status
 
@@ -34,177 +57,195 @@
 | 1 | Fix Search crash | **Done** | Unchanged this phase. See `docs/DECISIONS_LOG.md` 2026-08-07 entry. |
 | 2 | DB schema | **Done** | Unchanged this phase. See the seven `docs/DECISIONS_LOG.md` entries dated 2026-08-07. |
 | 3 | FastAPI skeleton | **Done** | Unchanged this phase. See the `docs/DECISIONS_LOG.md` entry dated 2026-08-08. |
-| 4 | Library page vertical slice | **Done** | Unchanged this phase. See the five `docs/DECISIONS_LOG.md` entries dated 2026-08-08 (Phase 4) plus the 2026-08-09 port-fix entry. |
-| 5 | Ingestion pipeline | **Done** | Real Celery task ([tasks/ingest_document.py](../services/ingestion/src/tasks/ingest_document.py)) replaces Phase 4's no-op, registered under the same `"ingest_document"` name. Full pipeline — classify → layout-segment → extract tables (camelot) → agentic-chunk (OpenAI, heuristic fallback) → embed (Cohere) → write (Qdrant + Postgres, shared `SourceLocation`) — implemented and verified live against real Docker infra (see snapshot header). Eleven `docs/DECISIONS_LOG.md` entries dated 2026-08-09, one per stage. |
-| 6 | Retrieval/generation pipeline | **Not Started** | `POST /query`/`POST /query/followup` exist as typed stubs (Phase 3) but return placeholder data; no retrieval or generation logic exists yet. Now has real ingested data (Phase 5's output) to retrieve against. |
-| 7 | Remaining pages | **In Progress (UI-only)** | Chat, Compare, Admin all still hardcoded mock data. Unchanged this phase. |
-| 8 | Eval/observability | **Not Started** | `eval/` directory exists, zero files. |
+| 4 | Library page vertical slice | **Done** | Unchanged this phase (`citations.py`'s stub got a small, non-functional matching update this phase — see its file inventory row below). |
+| 5 | Ingestion pipeline | **Done** | Unchanged this phase. Eleven `docs/DECISIONS_LOG.md` entries dated 2026-08-09. |
+| 6 | Retrieval/generation pipeline | **Done** | Real `POST /query`/`POST /query/followup` ([query.py](../services/api/src/api/v1/routes/query.py)) replace Phase 3's stubs, backed by eleven new `services/api/src/core/` modules implementing the full pipeline in `docs/architecture.md` §1 Pipeline B. `frontend/src/app/pages/Chat.tsx` calls the real API. Verified live against real ingested data and through the real browser UI (see snapshot header). Fifteen `docs/DECISIONS_LOG.md` entries dated 2026-08-09, one per pipeline stage/unit. |
+| 7 | Remaining pages | **In Progress (UI-only)** | Compare, Admin still hardcoded mock data. Chat.tsx is real as of this phase. |
+| 8 | Eval/observability | **Not Started** | `eval/` directory exists, zero files. This phase's live-verified confidence-score behavior (0.90 / 0.32 / 0.02 across three real test questions) is the first informal signal of pipeline quality, not a substitute for Phase 8's actual gold-set eval. |
 | 9 | Deployment | **Not Started** | No `Dockerfile`, no prod compose file, no `.github/workflows` files. |
 
 ## File Inventory
 
-### packages/shared/ — Phase 5 output (new)
+### services/api/src/core/ — Phase 6 output (new; directory didn't exist before this phase)
 
 | Path | Status | Description |
 |------|--------|-------------|
-| [pyproject.toml](../packages/shared/pyproject.toml) | Complete (new) | `setuptools`-backed, editable-installable local package (`aegis-shared`). Installed via `-e ../../packages/shared` in `services/ingestion/requirements.txt`. `services/api` does not install it yet — see Immediate Next Step. |
-| [aegis_shared/source_location.py](../packages/shared/aegis_shared/source_location.py) | Complete (new) | `SourceLocation` — the frozen dataclass every retrievable chunk's location is built from, once, at ingestion time (`docs/architecture.md` §2). `exact_location()`, `to_qdrant_payload()`, `from_qdrant_payload()`. Dependency-free by design. |
-| [aegis_shared/py.typed](../packages/shared/aegis_shared/py.typed) | Complete (new) | PEP 561 marker, so `mypy` trusts this package's types from a consuming service. |
+| [types.py](../services/api/src/core/types.py) | Complete (new) | `RankedChunk` (chunk_id + score, pre-hydration), `RetrievedChunk` (fully hydrated, per-stage scores) — the shared value types every other module in this directory agrees on. Not one of `PROJECT_HANDBOOK.md`'s named files; added because five modules needed the same shape. |
+| [bm25_retriever.py](../services/api/src/core/bm25_retriever.py) | Complete (new) | `search()` — Postgres full-text search (`to_tsvector`/`websearch_to_tsquery`/`ts_rank_cd`), not a literal Okapi BM25 library — no new dependency needed; see decisions log for the full reasoning. Backed by a new GIN index (below). |
+| [dense_retriever.py](../services/api/src/core/dense_retriever.py) | Complete (new) | `embed_query()` (Cohere, `input_type="search_query"`) + `search()` (Qdrant `query_points`). Deliberately does not import `services/ingestion`'s `embedder.py` — services stay decoupled by convention. Also exposes `get_qdrant_client()`, reused by `citation_resolver.py`. |
+| [rrf.py](../services/api/src/core/rrf.py) | Complete (new) | `reciprocal_rank_fusion()` — pure function, zero I/O, fuses any number of ranked lists by rank position (not raw score, which isn't comparable across BM25/dense). |
+| [hybrid_retriever.py](../services/api/src/core/hybrid_retriever.py) | Complete (new) | `retrieve()` — BM25 + dense in parallel (2-worker `ThreadPoolExecutor`) per query variant, RRF-fused, then one batched Postgres hydration query (joining `Document`/`Company`/`TableData`) for the fused top-N only. Each leg degrades to empty-on-failure rather than raising. |
+| [reranker.py](../services/api/src/core/reranker.py) | Complete (new) | `rerank()` — Cohere `rerank-v3.5` over the fused candidates; falls back to the RRF-fused order if `COHERE_API_KEY` is unset or the call fails. |
+| [multi_query.py](../services/api/src/core/multi_query.py) | Complete (new) | `expand_query()` — OpenAI-generated alternative phrasings (up to 2), run after history reformulation; falls back to `[query_text]` only on any failure or missing key. |
+| [history_manager.py](../services/api/src/core/history_manager.py) | Complete (new) | `reformulate_followup()` — OpenAI rewrite of a follow-up into a self-contained question using the conversation's prior turns (last 6); falls back to the follow-up text unchanged. |
+| [answer_generator.py](../services/api/src/core/answer_generator.py) | Complete (new) | `generate_answer()` — grounded OpenAI generation with `[n]`-marker citation requirements in the system prompt; falls back to a zero-synthesis extractive answer (verbatim top-3-chunk content) with no `OPENAI_API_KEY`. Both paths live-verified this phase — the fallback first, then the real LLM path after a key was added (see snapshot header). |
+| [numeric_verifier.py](../services/api/src/core/numeric_verifier.py) | Complete (new); one bugfix this phase | `verify_answer()` — deterministic (no LLM) regex/arithmetic extraction of numeric claims per citation marker, checked against that citation's exact source content (full `TableData.raw_table_json` for table chunks, not the truncated `content` summary). Four-way raw/scaled value matching to handle prose-vs-table scale-convention mismatches. Verified live against 58 real numeric claims from a genuine SEC filing table — zero false negatives. **Bugfix (same phase, after the LLM path went live):** text after the last citation marker wasn't scanned at all — an uncited, model-computed derived figure passed through completely unchecked rather than merely unverified. Fixed: trailing text is now scanned and any numeric claim found there is an automatic, unverified failure (`citation_index=0` sentinel). See `docs/DECISIONS_LOG.md`. |
+| [confidence_scorer.py](../services/api/src/core/confidence_scorer.py) | Complete (new) | `retrieval_confidence()` (pre-generation signal) + `score_final()` (post-generation: an unverified numeric claim caps confidence hard, regardless of retrieval strength). Live-verified across three real scenarios (0.90 / 0.32 / 0.02). |
+| [citation_resolver.py](../services/api/src/core/citation_resolver.py) | Complete (new) | `resolve_source_location()` — cheap Postgres-only reconstruction for narrative/footnote chunks; a Qdrant point lookup (by `chunk_id` = point ID) for table chunks, since `table_cell_ref` only ever lived in Qdrant's payload. `build_snippet()` for the stored citation display text. Live-verified: resolved `p.3 (table 0)` correctly for a real table citation. |
 
-### services/ingestion/ — Phase 5 output (new; was `requirements.txt` + empty `venv/` only)
-
-| Path | Status | Description |
-|------|--------|-------------|
-| [src/infra/db.py](../services/ingestion/src/infra/db.py), [celery_app.py](../services/ingestion/src/infra/celery_app.py), [storage.py](../services/ingestion/src/infra/storage.py) | Complete (new) | Sync SQLAlchemy engine/session (same `DATABASE_URL` as `services/api`, separate module — see decisions log); the consumer-side Celery app (`include=["src.tasks.ingest_document"]`); `resolve_source_path()`, the read-side counterpart to the API's `save_uploaded_pdf`. |
-| [src/storage/models.py](../services/ingestion/src/storage/models.py) | Complete (new) | A second, independent set of SQLAlchemy 2.0 models (`Company`, `Document`, `DocumentChunk`, `TableData`) mirroring only the columns ingestion touches — deliberately not imported from `services/api`. See decisions log for the full reasoning. |
-| [src/parsing/pdf_parser.py](../services/ingestion/src/parsing/pdf_parser.py) | Complete (new) | `parse_pdf()` — pymupdf structural parse: per-page text, font-annotated `TextLine`s, candidate table bboxes via `Page.find_tables()`. |
-| [src/parsing/document_classifier.py](../services/ingestion/src/parsing/document_classifier.py) | Complete (new) | `classify_document()` — heuristic filing/transcript/deck/unknown classification; `matches_declared_type()` cross-checks against the analyst's upload-time `document_type` (logged, not enforced). |
-| [src/parsing/layout_segmenter.py](../services/ingestion/src/parsing/layout_segmenter.py) | Complete (new) | `segment_document()`/`segment_page()` — narrative/footnote/table-region split per page, via font size, page position, and footnote-marker regex, plus bbox-overlap exclusion of table regions. |
-| [src/parsing/table_extractor.py](../services/ingestion/src/parsing/table_extractor.py) | Complete (new) | `extract_tables()` — camelot, lattice-first with a stream fallback for low-accuracy pages, structured `headers`/`rows` output, never flattened. |
-| [src/chunking/agentic_chunker.py](../services/ingestion/src/chunking/agentic_chunker.py) | Complete (new) | `chunk_narrative_page()` — OpenAI (`gpt-4o-mini`, JSON mode) section-boundary detection with a deterministic paragraph-boundary heuristic fallback (no key set / call fails / malformed response); `_enforce_size_bounds` applies uniformly to both paths. `build_footnote_chunks()` (no LLM). |
-| [src/chunking/table_chunker.py](../services/ingestion/src/chunking/table_chunker.py) | Complete (new) | `chunk_table()`/`chunk_tables()` — one chunk per table, row-aligned splits (never mid-row) past 60 rows; `_embedding_text()` generates a flattened summary *only* as Cohere's embedding input, never the stored representation. |
-| [src/embedding/embedder.py](../services/ingestion/src/embedding/embedder.py) | Complete (new) | `embed_texts()` — Cohere `embed-english-v3.0`, 1024-dim, batched, `input_type`-aware (`search_document` today; `search_query` reserved for Phase 6). |
-| [src/storage/qdrant_writer.py](../services/ingestion/src/storage/qdrant_writer.py) | Complete (new) | `ensure_collection()` (creates `document_chunks`, cosine distance, payload indexes on `loc_document_id`/`ticker`/`document_type`/`loc_chunk_type`/`fiscal_year`/`fiscal_quarter`) and `upsert_chunk_vector()` — point ID is the chunk's own `chunk_id`. |
-| [src/storage/metadata_writer.py](../services/ingestion/src/storage/metadata_writer.py) | Complete (new) | `load_document_context()`, `set_document_status()`, `upsert_document_chunk()`/`upsert_table_data()` (real `INSERT ... ON CONFLICT DO UPDATE`, idempotent re-ingestion), `set_embedding_vector_id()`. |
-| [src/tasks/ingest_document.py](../services/ingestion/src/tasks/ingest_document.py) | Complete (new) | The real `ingest_document` Celery task — replaces Phase 4's no-op under the same task name. Orchestrates every stage above, assigns `chunk_index` per page, builds `SourceLocation` once per chunk, drives `Document.status` through `PENDING → PROCESSING → COMPLETED`/`FAILED` with `autoretry_for`/`retry_backoff` and a custom `on_failure` handler. |
-| [pyproject.toml](../services/ingestion/pyproject.toml) | Complete (new) | `mypy`/`pytest` config, mirroring `services/api`'s — includes `mypy_path` pointing at `packages/shared`'s real source (see decisions log for why the editable install alone wasn't enough for `mypy`). |
-| [requirements.txt](../services/ingestion/requirements.txt) | Updated | Added `openai>=1.50` and `-e ../../packages/shared`. |
-| [tests/unit/test_source_location.py](../services/ingestion/tests/unit/test_source_location.py), [test_document_classifier.py](../services/ingestion/tests/unit/test_document_classifier.py), [test_layout_segmenter.py](../services/ingestion/tests/unit/test_layout_segmenter.py), [test_table_chunker.py](../services/ingestion/tests/unit/test_table_chunker.py), [test_agentic_chunker.py](../services/ingestion/tests/unit/test_agentic_chunker.py) | Complete (new) | 24 tests covering every pure-function pipeline piece (no live DB/Qdrant/API calls needed) — notably `test_table_chunker.py`'s 127-row split-boundary check and `test_agentic_chunker.py`'s heuristic-fallback/size-bound tests, both of which caught and fixed real bugs (see decisions log) before this phase's live smoke test. |
-
-### Root — Phase 5 output
+### services/api/src/api/, models/ — Phase 6 changes (existing files)
 
 | Path | Status | Description |
 |------|--------|-------------|
-| [.env.example](../.env.example) | Updated | Removed the unused `EMBEDDING_API_KEY` placeholder (embedding provider decision resolved this phase — see decisions log); added `COHERE_EMBED_MODEL`/`OPENAI_API_KEY`/`OPENAI_CHUNKING_MODEL`/`QDRANT_COLLECTION` documentation (all optional, sane in-code defaults). |
+| [api/v1/routes/query.py](../services/api/src/api/v1/routes/query.py) | Rewritten | Real `POST /query`/`POST /query/followup`, replacing Phase 3's typed stubs. Shared `_handle_query` runs the full pipeline in order (multi-query → hybrid retrieve → rerank → confidence → generate → verify → confidence (final) → citation resolve), renumbers `[n]` citation markers to line up positionally with the response's `citations` list, and persists `Query`/`Answer`/`Citation` rows. |
+| [api/v1/deps.py](../services/api/src/api/v1/deps.py) | Updated | Adds `get_or_create_actor()` — find-or-create for a placeholder `Organization`+`User` (mirrors `documents.py`'s Phase 4 `Company` find-or-create), since Phase 6 is the first phase needing a real, persisted `User` row for `Conversation.user_id` and no seed script/real auth populates one yet. |
+| [api/v1/routes/citations.py](../services/api/src/api/v1/routes/citations.py) | Small update | Still a Phase 3 stub (out of Phase 6's scope) — its placeholder `CitationResponse(...)` construction updated with placeholder values for the schema's new required fields (below) so it keeps constructing/type-checking correctly. |
+| [models/schemas/citation.py](../services/api/src/models/schemas/citation.py) | Updated | `CitationResponse` gains `document_title`/`document_type`/`ticker`/`page_number`/`fiscal_year`/`fiscal_quarter` — display context sourced from the cited chunk's `Document`/`Company`, not the `Citation` row itself, so `query.py` builds these by hand rather than via `model_validate`. |
+| [models/db/__init__.py](../services/api/src/models/db/__init__.py), other `models/db/*.py` | Unchanged | No schema changes to any of the 11 ER-model tables this phase — only a new index (below), no new/altered columns. |
+
+### migrations/ — Phase 6 output (new)
+
+| Path | Status | Description |
+|------|--------|-------------|
+| [3100d4408cc5_add_document_chunks_content_fts_index.py](../migrations/versions/3100d4408cc5_add_document_chunks_content_fts_index.py) | Complete (new) | Hand-written (not autogenerated — SQLAlchemy's declarative layer has no construct for a functional index) `CREATE INDEX ... USING GIN (to_tsvector('english', content))` on `document_chunks`, backing `bm25_retriever.py`. Applied against the real local Postgres this phase. |
+
+### services/api/ — dependency/config changes
+
+| Path | Status | Description |
+|------|--------|-------------|
+| [requirements.txt](../services/api/requirements.txt) | Updated | Adds `openai>=1.50` (reusing the Phase 5-approved vendor, now also used for generation/reformulation/expansion — see decisions log) and `-e ../../packages/shared` (this service's first consumer of `SourceLocation`, via `citation_resolver.py` — the concrete carry-over flagged in Phase 5's snapshot). Both installed into the real venv this phase. |
+| [pyproject.toml](../services/api/pyproject.toml) | Updated | Adds `[tool.mypy] mypy_path = ["../../packages/shared"]` — same editable-install/mypy gap `services/ingestion` hit in Phase 5, now hit here too since this service imports `aegis_shared` for the first time. |
+
+### frontend/ — Phase 6 output
+
+| Path | Status | Description |
+|------|--------|-------------|
+| [src/app/lib/api.ts](../frontend/src/app/lib/api.ts) | Updated | Adds `CitationRecord`/`QueryRecord` types (mirroring `query.py`'s Pydantic schemas) and `submitQuery`/`submitFollowupQuery`. |
+| [src/app/pages/Chat.tsx](../frontend/src/app/pages/Chat.tsx) | Rewritten | Real conversation state (`messages`, `conversationId`) replacing the hardcoded `MOCK_CITATIONS`/static example Q&A. First message in a thread → `/query`; every subsequent message → `/query/followup`. `[n]` markers in `answer_text` render as clickable badges resolved positionally via `citations[n - 1]` (safe because the backend guarantees contiguous renumbering — see decisions log). Confidence score + low-confidence warning rendered per assistant message. Empty-project state (`activeProject.isEmpty`) untouched — pure frontend/mock concept, no backend `Project` entity exists. |
 
 ### Everything else (unchanged this phase, re-verified where noted)
 
 | Area | Status |
 |------|--------|
-| `services/api` | Unchanged. `POST /documents` still enqueues via the same `"ingest_document"` task name Phase 5's real worker now serves — re-verified live this phase (see snapshot header). |
-| `frontend` | Unchanged. |
-| `packages/shared` | New this phase (see above) — was empty. |
+| `services/ingestion` | Unchanged. Not re-run this phase; this phase read the real chunks/tables it wrote in Phase 5 and in ad hoc testing since (see snapshot header). |
+| `packages/shared` | Unchanged code-wise. Now installed into **both** services' venvs (`services/ingestion` since Phase 5, `services/api` new this phase). |
+| `frontend` (Library, Compare, Admin) | Unchanged. `Compare.tsx`/`Admin.tsx` still mock — Phase 7's scope. |
 | `infra/k8s`, `infra/terraform` | Empty. |
 | `eval` | Empty. |
 | `.github/workflows` | Empty. |
 | `docs` | `architecture.md`/`Financial_RAG_Project_Structure.md` unchanged. |
-| `data/uploads/` | Gitignored. Now contains real processed PDFs from this phase's live smoke test in addition to Phase 4's, transiently — not committed. |
+| `data/uploads/` | Gitignored, not touched this phase (no new uploads through the API — this phase queried existing ingested data). |
+| Repo root | An untracked real SEC 10-K PDF (`Energy Services of America CORP_September 30, 2025.pdf`) is present, pre-existing at the start of this phase (not created by this phase's work) — its already-ingested chunks were used as this phase's primary live-verification corpus alongside Phase 5's synthetic Acme filing. Not moved, renamed, or committed by this phase. |
 
 ## Known Issues / Bugs
 
 **Carried over, unchanged this phase:** the full frontend known-issue
-checklist and Phase 4 notes from the previous snapshot (unused shadcn
+checklist and Phase 4/5 notes from the previous snapshot (unused shadcn
 components, disconnected dark-mode tokens, missing aria-labels, no
 `GET /documents/{id}/file`, `GET /documents` not tenant-filtered by
 design, `POST /documents`'s unguarded find-or-create race, local-disk
-storage needing a Phase 9 rework) — see git history for the full table,
+storage needing a Phase 9 rework, no dead-letter queue, heuristic
+document/table/footnote detection) — see git history for the full table,
 none fixed or newly introduced this phase.
 
-**Phase 5-specific notes:**
-- **No dead-letter queue.** `ingest_document`'s `autoretry_for`/
-  `retry_backoff` retries transient failures (verified live: a stale
-  message referencing a deleted document row retried 3x with backoff,
-  1s/2s/3s, then gave up cleanly). Once retries are exhausted, the
-  `Document.status = FAILED` row *is* the alert surface — Redis (unlike
-  RabbitMQ) doesn't give a real dead-letter queue for free, and building
-  one wasn't in this phase's scope. Revisit if silent `FAILED` rows
-  become a real operational problem.
-- **`autoretry_for=(Exception,)` doesn't distinguish retryable
-  (transient API timeout) from deterministic (corrupt PDF, code bug)
-  failures** — both get the same 3-retry treatment. Consistent with
-  `docs/architecture.md` §3's stated retry behavior for a corrupt PDF,
-  but means a deterministic bug wastes ~3 retry cycles before surfacing.
-- **`OPENAI_API_KEY` is optional, not required** — if unset,
-  `agentic_chunker.py` silently uses its heuristic paragraph-boundary
-  fallback instead of real LLM-assisted boundaries. This phase's entire
-  live smoke test ran through that fallback path (no key configured in
-  this environment's `.env`) — ingestion works correctly either way, but
-  chunk boundaries are only as good as the heuristic until a real key is
-  added.
-- **`services/api` does not yet install `packages/shared`** — nothing
-  there needs `SourceLocation` until Phase 6's `citation_resolver.py`.
-  Flagged explicitly in Immediate Next Step below so it isn't forgotten.
-- **Table-region exclusion, footnote detection, and document
-  classification are all heuristic**, tuned by inspection and this
-  phase's unit/smoke tests, not against a labeled dataset — Phase 8's
-  eval harness is the natural point to measure whether any of these
-  heuristics are actually costing retrieval precision.
-- **No per-document integration test in CI** — this phase's end-to-end
-  verification was a live, manual run against real Docker infra (see
-  snapshot header), not an automated test that runs on every change.
-  Phase 8 (eval) or a dedicated CI integration-test pass could formalize
-  this; out of scope for Phase 5 itself per `PROJECT_HANDBOOK.md`.
+**Phase 6-specific notes:**
+- **`OPENAI_API_KEY` is now configured** (added partway through this
+  phase) — both the no-key fallback paths and the real LLM-backed paths
+  for `multi_query.py`/`history_manager.py`/`answer_generator.py` are now
+  live-verified (see snapshot header). The LLM path's first real run
+  immediately surfaced a genuine bug in `numeric_verifier.py` (uncited
+  trailing claims were invisible, not just unverified) — fixed the same
+  session; see that file's row above and `docs/DECISIONS_LOG.md`.
+- **`get_or_create_actor`'s find-or-create has the same accepted,
+  low-probability concurrent-request race** `documents.py`'s `Company`
+  find-or-create already accepted in Phase 4 (no `SELECT ... FOR UPDATE`)
+  — consistent with existing precedent, not a new gap.
+- **Retrieval/rerank/context-size constants
+  (`_RETRIEVE_TOP_N=20`, `_RERANK_TOP_N=6`, per-leg `top_k=30`, RRF
+  `k=60`, confidence thresholds `0.4`/`0.35`) are all picked by
+  inspection**, not tuned against labeled data — Phase 8's eval harness
+  is the natural point to revisit every one of these with real numbers
+  instead of judgment calls.
+- **`numeric_verifier.py`'s match tolerance (`rel_tol=0.02, abs_tol=0.05`)**
+  is likewise inspection-calibrated, not validated against a labeled
+  mismatch set.
+- **No caching of repeated queries or rerank calls** — every request
+  pays a full Cohere rerank call even for an identical question asked
+  twice. `docs/architecture.md`'s deployment notes flag this as a
+  reasonable Phase 9 addition (filings update quarterly, so aggressive
+  caching is safe), not addressed here.
+- **No streaming** — `answer_generator.py` makes one blocking
+  `chat.completions.create` call; the Chat UI shows a static spinner,
+  not token-by-token output.
+- **`citations.py` (`GET /citations/{id}`) is still a Phase 3 stub** —
+  real `Citation`/`Answer`/`Query` rows now exist in Postgres for it to
+  actually look up, but that route's real implementation is out of Phase
+  6's scope per `PROJECT_HANDBOOK.md`.
+- **No `tsconfig.json` for the frontend yet** (flagged since Phase 1) —
+  `Chat.tsx`'s new TypeScript was verified via `vite build` (real
+  transpilation/bundling, catches unresolved imports and syntax errors)
+  and a live browser run, not `tsc --noEmit`.
+- **No automated integration test for the query pipeline in CI** — this
+  phase's verification was live and manual (direct API calls + a
+  Playwright-driven browser session), matching Phase 5's precedent; a
+  real `tests/integration/test_query_endpoint.py` (named in
+  `Financial_RAG_Project_Structure.md`'s original plan) doesn't exist
+  yet.
 
 **Grep for TODO/FIXME/XXX/NotImplementedError/bare `pass`:** No matches
-under `services/ingestion/src` or `packages/shared` (checked as part of
+under `services/api/src/core` or the modified files (checked as part of
 this phase).
 
 ## Deviations From the Original Plan
 
-- **Two new external dependencies (Cohere embeddings, OpenAI chunking)
-  were added this phase, both after asking Sam directly** — `CLAUDE.md`
-  §4 requires stopping before adding a dependency outside the agreed
-  stack, and neither the embedding provider (explicitly flagged
-  undecided since Phase 2) nor an LLM vendor for agentic chunking
-  (never named anywhere) had been resolved yet. Full reasoning in
-  `docs/DECISIONS_LOG.md`'s "Provider decisions" entry.
-- **`packages/shared` is now real** (an editable-installed local Python
-  package, `aegis-shared`), not just an empty folder per
-  `PROJECT_HANDBOOK.md` §4's structure map. Holds exactly one type
-  (`SourceLocation`) — deliberately not the SQLAlchemy models, which
-  stay independently mirrored in each service instead (see decisions
-  log for why).
-- **`services/ingestion/src/storage/models.py` is a second, independent
-  set of SQLAlchemy models**, not imports from `services/api/src/models/
-  db/`. A real architectural fork, explained at length in the decisions
-  log — `PROJECT_HANDBOOK.md` §6 Phase 5's file list scopes this phase
-  to `services/ingestion/src/` only, and the two services' Celery apps
-  already established (Phase 4) the "agree by convention, never by
-  sharing Python code" principle this follows.
-- **`mypy_path` added to `services/ingestion/pyproject.toml`** — not
-  part of any phase's planned file list, needed because `mypy`'s static
-  import resolution doesn't follow `setuptools`' modern editable-install
-  mechanism the way the real Python interpreter does. Reproduced the
-  failure first, then fixed it; see decisions log.
-- **`document_classifier.py`'s content-based classification does not
-  override or block on a mismatch with the analyst's declared
-  `document_type`** — only logged. `docs/architecture.md` §3's decision
-  table describes a "manual-review queue" for repeated classification
-  failures that doesn't exist as infrastructure yet; a warning log line
-  is the honest current substitute.
+- **`bm25_retriever.py` uses Postgres full-text search, not a literal
+  BM25 implementation** — no new dependency needed (Postgres is already
+  the agreed relational store); `rank_bm25`/Elasticsearch/OpenSearch
+  would each have been a new external dependency requiring a check-in
+  per `CLAUDE.md` §4. Full reasoning in `docs/DECISIONS_LOG.md`.
+- **`openai>=1.50` added to `services/api/requirements.txt`** — not
+  treated as a fresh "new dependency" check-in since the vendor itself
+  was already approved project-wide in Phase 5 (asked of Sam directly
+  this phase anyway, for which *use* — generation vs. a new vendor —
+  per Phase 5's explicit "this entry doesn't presume [Phase 6] has to be
+  OpenAI too" note). See decisions log.
+- **`core/types.py` was added beyond `PROJECT_HANDBOOK.md`'s named file
+  list** — a small shared-value-types module (`RankedChunk`,
+  `RetrievedChunk`) five other named modules needed to agree on; not
+  business logic, the same spirit as `packages/shared`'s `SourceLocation`.
+- **`CitationResponse` gained six display-only fields not in the
+  original Phase 3 schema** — needed so the Chat UI's citation panel can
+  render ticker/document/page context without a second round-trip per
+  citation; additive, not a breaking change to the schema's original
+  fields.
+- **`get_or_create_actor` (a real, if placeholder, `User`/`Organization`
+  find-or-create) was added to `deps.py`**, not part of any phase's
+  planned file list — a real, previously-undiscovered gap (no seed
+  script or real auth ever populated `organizations`/`users`), resolved
+  by extending the exact pattern Phase 4 already established for
+  `Company`, not a new convention.
+- **`numeric_verifier.py`'s citation-marker window logic changed mid-phase**
+  from what was originally shipped and decisions-logged (only text
+  *preceding* a `[n]` marker was ever scanned) to also scanning text
+  *after* the last marker as automatic unverified failures — not part of
+  the original design, discovered live once a real `OPENAI_API_KEY` was
+  added and a real model produced an uncited trailing claim. See the
+  dedicated bugfix entry in `docs/DECISIONS_LOG.md`.
 - Everything from the previous snapshot's deviations list (Phase 4's
-  tenant-filtering choice, the multipart form-field shape, `CORSMiddleware`,
-  local-disk storage, and earlier phases' items) still stands and wasn't
-  touched this phase.
+  tenant-filtering/shared-corpus choice, Phase 5's provider decisions and
+  independent storage models) still stands and wasn't touched this phase.
 
 ## Immediate Next Step
 
-Phase 5 is done — a real PDF goes in, structured narrative/footnote/table
-chunks come out, with a consistent `SourceLocation` in both Qdrant and
-Postgres, verified against real infrastructure (not just unit tests).
-Next up is **Phase 6: retrieval/generation wired to Chat**
-(`PROJECT_HANDBOOK.md` §6) — `services/api/src/core/` doesn't exist yet;
-`POST /query`/`POST /query/followup` are still Phase 3's typed stubs.
-Phase 6 needs to: implement `bm25_retriever.py`, `dense_retriever.py`,
-`hybrid_retriever.py`, `rrf.py`, `reranker.py` (Cohere — already an
-agreed dependency in `services/api`), `multi_query.py`, `history_manager.py`,
-`answer_generator.py` (needs its own LLM-provider decision — reusing
-OpenAI, already added this phase for `services/ingestion`, would avoid a
-third vendor, but that's Sam's call, not a default to assume),
-`numeric_verifier.py`, `confidence_scorer.py`, and `citation_resolver.py`.
-Two concrete carry-overs from this phase, not optional cleanup:
-1. **`pip install -e packages/shared` needs to be run in `services/api`'s
-   venv too** — `citation_resolver.py` is the first API-side consumer of
-   `SourceLocation`, and nothing there installs `aegis-shared` yet.
-2. **Dense retrieval must embed queries with `input_type="search_query"`**
-   (`services/ingestion/src/embedding/embedder.py`'s `InputType` already
-   supports this) — using `"search_document"` for queries would work
-   without erroring but measurably hurt retrieval quality, since Cohere's
-   v3 embed models are trained with different instruction prefixes per
-   `input_type`.
+Phase 6 is done — a real question in the Chat UI now produces a grounded
+answer with citations that resolve to a real page/table location, live-
+verified against both a synthetic filing and a genuine downloaded SEC
+10-K, with confidence scoring that behaves sensibly across a strong
+match, a weak match, a nonsense query, and (after a real `OPENAI_API_KEY`
+was added and immediately caught a real numeric-verification bug, since
+fixed) genuine LLM-backed generation and follow-up reformulation. Next up
+is **Phase 7: remaining pages** (`PROJECT_HANDBOOK.md` §6) — `Compare.tsx`
+and `Admin.tsx` still render `MOCK_METRICS`/inline mock arrays; Phase 7
+needs real endpoints for cross-quarter metric comparison and the Admin
+analytics/flagged-answers views (reading from the `Answer`/`Citation`/
+`EvalResult` tables Phase 6 now actually populates).
 
-Real ingested data now exists to retrieve against (this phase's live
-smoke test left two real, fully-ingested documents in the local Postgres/
-Qdrant — one seeded from Phase 4, one this phase's synthetic 10-K test
-PDF), so Phase 6 can be verified against real data from the start rather
-than needing to re-run ingestion first.
+One concrete carry-over from this phase, not optional cleanup:
+**Phase 8's eval harness should revisit every inspection-calibrated
+constant** introduced this phase (`_RETRIEVE_TOP_N`, `_RERANK_TOP_N`,
+RRF's `k`, `numeric_verifier.py`'s match tolerance, both confidence
+thresholds) against real gold-set numbers instead of judgment calls made
+without eval data — and specifically re-check `numeric_verifier.py`'s
+now-strict "an uncited claim is always unverified" rule against real
+model outputs at scale, since it was added from a single live example,
+not a labeled set.

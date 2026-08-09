@@ -1,3 +1,9 @@
+[tool.mypy]
+# Same gap as services/ingestion/pyproject.toml (Phase 5): mypy's static
+# import resolution doesn't follow setuptools' editable-install mechanism
+# for packages/shared the way the real interpreter does at runtime.
+mypy_path = ["../../packages/shared"]
+
 [tool.ruff.lint.flake8-bugbear]
 # `Depends(...)` (and FastAPI's other `params` helpers) as a function
 # *default* is the framework's documented, required DI pattern -- not the

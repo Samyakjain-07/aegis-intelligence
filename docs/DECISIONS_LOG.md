@@ -1769,3 +1769,713 @@ enqueued by `services/api`'s `POST /documents` (Phase 4, unchanged this
 phase). Downstream: nothing yet reads its output -- Phase 6's retrieval
 pipeline is the first consumer of the `DocumentChunk`/`TableData`/Qdrant
 data this task produces.
+
+---
+
+## [2026-08-09] Phase 6 LLM vendor decision: OpenAI for generation/reformulation/expansion
+**Phase:** 6 -- retrieval/generation pipeline (setup)
+**What was built:** No code -- a recorded decision, asked of Sam directly
+before writing `answer_generator.py`, `multi_query.py`, or
+`history_manager.py`, since Phase 5's "Provider decisions" entry
+explicitly left this open ("Phase 6's `answer_generator.py` will need its
+own LLM-provider decision; this entry doesn't presume that one has to be
+OpenAI too").
+**Why this approach:** Asked as a single question: reuse OpenAI (already
+approved in Phase 5 for `agentic_chunker.py`) versus add Anthropic as a
+third vendor. Sam chose OpenAI. One vendor relationship now covers
+chunking (ingestion) *and* generation/reformulation/expansion (query
+pipeline) instead of a third API key/SDK/billing relationship for
+marginal differentiation at this project's scale -- consistent with the
+same reasoning that put Cohere behind both rerank and embeddings in Phase
+5.
+**Key concepts a reviewer should understand:**
+- This is `CLAUDE.md` §4's stop-and-ask boundary working exactly as
+  designed a second time: a real, consequential choice existed (which
+  vendor answers every question a user ever asks), it wasn't defensible
+  to default silently, so it was asked.
+- All three new OpenAI call sites (`multi_query.py`, `history_manager.py`,
+  `answer_generator.py`) follow `agentic_chunker.py`'s established
+  optional-key/deterministic-fallback contract from Phase 5 -- none of
+  them can turn a missing `OPENAI_API_KEY` into a hard failure. See each
+  module's own entry below for its specific fallback.
+**Tradeoffs / deliberately left out:** `services/api/requirements.txt`
+now carries `openai>=1.50` for the first time (previously ingestion-only)
+-- not treated as "a new dependency outside the agreed stack" requiring a
+fresh check-in, since the vendor itself was already approved project-wide
+in Phase 5; only *which service* imports the SDK changed.
+**How it connects to the rest of the system:** Governs every OpenAI call
+added this phase. `OPENAI_CHAT_MODEL` (default `gpt-4o-mini`, same
+default family as ingestion's `OPENAI_CHUNKING_MODEL`) is the one new env
+var this decision introduces; `COHERE_RERANK_MODEL` (default
+`rerank-v3.5`, `reranker.py`) is the other new optional env var this
+phase adds. Both, plus `OPENAI_API_KEY` now being a two-service key, are
+documented in `.env.example`.
+
+---
+
+## [2026-08-09] `bm25_retriever.py` + the content full-text-search migration
+**Phase:** 6 -- retrieval/generation pipeline
+**What was built:** [`core/bm25_retriever.py`](../services/api/src/core/bm25_retriever.py)
+-- lexical retrieval over `document_chunks.content` via Postgres's
+built-in full-text search (`to_tsvector`/`websearch_to_tsquery`/
+`ts_rank_cd`), backed by a hand-written Alembic migration,
+[`3100d4408cc5_add_document_chunks_content_fts_index.py`](../migrations/versions/3100d4408cc5_add_document_chunks_content_fts_index.py),
+adding a `GIN (to_tsvector('english', content))` index.
+**Why this approach:** `PROJECT_HANDBOOK.md` names this module
+`bm25_retriever.py`, but the literal Okapi BM25 ranking formula isn't
+available from any dependency already in the agreed stack -- getting it
+exactly would mean adding `rank_bm25` (an in-memory, un-indexed library
+that doesn't scale past a toy corpus) or a real search engine
+(Elasticsearch/OpenSearch), both of which are new external services
+`CLAUDE.md` §4 requires flagging before adding. Postgres full-text search
+needs neither: Postgres is already the agreed relational store, and
+`ts_rank_cd` plays the same architectural role BM25 would -- a sparse,
+exact-lexical-match signal fused against the dense leg via RRF -- without
+a new dependency. This wasn't treated as a stop-and-ask boundary (no new
+service was added), but it's still flagged here explicitly since it's a
+real substitution worth Sam knowing about, not a hidden implementation
+detail: `ts_rank_cd`'s formula (term frequency, proximity, document
+length normalization) differs from Okapi BM25's, even though both serve
+"sparse lexical retrieval" in the hybrid architecture.
+**Key concepts a reviewer should understand:**
+- The GIN index is a **functional** index (`to_tsvector('english',
+  content)`), not an index on `content` itself -- SQLAlchemy's
+  declarative `Column`/`mapped_column` machinery has no construct for
+  this, so the migration is hand-written (`op.execute(...)`) rather than
+  `alembic revision --autogenerate`'d, the same "autogenerate can't
+  express this" situation `8c520544e49c` hit for a different reason
+  (enum-type creation) in Phase 4.
+- An empty ranked list from `bm25_retriever.search()` isn't an error --
+  a query with no lexically-matchable content (e.g. pure stopwords)
+  legitimately produces zero full-text hits, and `hybrid_retriever.py`
+  treats that as "this leg found nothing," falling back to the dense
+  leg alone rather than failing the request.
+**Tradeoffs / deliberately left out:** No relevance-tuning beyond
+Postgres's defaults (`english` text-search configuration, default
+`ts_rank_cd` weighting) -- reasonable to revisit once Phase 8's eval
+harness can measure whether lexical-match quality is actually a
+bottleneck.
+**How it connects to the rest of the system:** One of the two legs
+`hybrid_retriever.py` runs in parallel per query variant; its output
+feeds `rrf.py`'s fusion alongside `dense_retriever.py`'s.
+
+---
+
+## [2026-08-09] `dense_retriever.py`
+**Phase:** 6 -- retrieval/generation pipeline
+**What was built:** [`core/dense_retriever.py`](../services/api/src/core/dense_retriever.py)
+-- embeds the query text with Cohere (`input_type="search_query"`) and
+searches Qdrant's `document_chunks` collection for nearest neighbors via
+`query_points`.
+**Why this approach:** `input_type="search_query"` is the deliberate,
+previously-flagged carry-over from Phase 5 (`docs/progress.md`'s "Phase 5
+Immediate Next Step" #2): ingestion embedded every stored chunk with
+`"search_document"`, and Cohere's v3 embed models are trained with
+different instruction prefixes per `input_type` -- using the wrong one
+wouldn't error, it would just measurably hurt retrieval quality. This
+module deliberately does **not** import `services/ingestion/src/
+embedding/embedder.py`, even though the Cohere call is nearly identical
+-- the two services stay decoupled by convention (same model name/env var,
+never shared Python code), the same principle Phase 5 established for
+`storage/models.py`. `qdrant_client 1.19`'s `query_points` is used
+instead of the older `search` method, which this version's client no
+longer exposes at all (confirmed via `dir(QdrantClient)` before writing
+this, not assumed from older docs).
+**Key concepts a reviewer should understand:**
+- `get_qdrant_client()` is exported (not `_`-prefixed) specifically so
+  `citation_resolver.py` can reuse the same lazily-created client for its
+  own, unrelated Qdrant point lookups (recovering a table chunk's
+  `table_cell_ref`) -- one shared connection instead of two independent
+  ones to the same collection.
+- Unlike `reranker.py`, this module has **no fallback** for a missing
+  `COHERE_API_KEY` or a failed call -- it raises. There is no meaningful
+  dense retrieval without an embedding (mirrors `embedder.py`'s Phase 5
+  reasoning for the same asymmetry); `hybrid_retriever.py` is the layer
+  that decides a failed dense leg degrades to BM25-only rather than
+  failing the whole request, not this module pretending success.
+**Tradeoffs / deliberately left out:** No retry/backoff around the Cohere
+call itself, matching `embedder.py`'s Phase 5 precedent -- a query-time
+Cohere hiccup propagates and `hybrid_retriever.py`'s per-leg guard turns
+it into "BM25-only for this request," not a crash.
+**How it connects to the rest of the system:** The other leg
+`hybrid_retriever.py` runs in parallel with `bm25_retriever.py`.
+`citation_resolver.py` also depends on this module, for its shared Qdrant
+client, not its retrieval function.
+
+---
+
+## [2026-08-09] `rrf.py`
+**Phase:** 6 -- retrieval/generation pipeline
+**What was built:** [`core/rrf.py`](../services/api/src/core/rrf.py) --
+Reciprocal Rank Fusion, combining any number of independently-ranked
+candidate lists into one fused ranking.
+**Why this approach:** Fuses by each candidate's **rank position** within
+its own list, not by its raw score. This is RRF's entire reason to exist
+here, not an oversight: BM25's `ts_rank_cd` output and Qdrant's cosine
+similarity live on completely different, incomparable numeric scales --
+summing or averaging them directly would let whichever retriever happens
+to produce larger raw numbers silently dominate the fusion. `1/(k+rank)`
+per list, summed across every list a chunk appears in, is scale-free by
+construction, with the standard damping constant (`k=60`, from Cormack,
+Clarke & Buettcher 2009) kept as the module's documented default rather
+than re-derived.
+**Key concepts a reviewer should understand:**
+- A chunk found by *both* BM25 and dense retrieval (or by dense retrieval
+  across two different multi-query reformulations) accumulates votes from
+  every list it appears in -- this is RRF's implicit "independent
+  retrievers agreeing on this chunk is itself a signal" behavior, not
+  something coded as a special case.
+- The only module in the Phase 6 pipeline with zero I/O -- deliberately,
+  so it's the cheapest piece to unit-test in isolation
+  (`PROJECT_HANDBOOK.md`'s planned `tests/unit/test_rrf.py`).
+**Tradeoffs / deliberately left out:** `k=60` is the paper's standard
+value, not tuned against this project's own retrieval distribution --
+Phase 8's eval harness is the right place to check whether a different
+`k` measurably changes retrieval precision here.
+**How it connects to the rest of the system:** Called by
+`hybrid_retriever.py`, once per query, over every BM25/dense list pair
+collected across all of `multi_query.py`'s expanded query variants.
+
+---
+
+## [2026-08-09] `hybrid_retriever.py`
+**Phase:** 6 -- retrieval/generation pipeline
+**What was built:** [`core/hybrid_retriever.py`](../services/api/src/core/hybrid_retriever.py)
+-- runs BM25 + dense retrieval concurrently for every query variant
+passed in, fuses everything via `rrf.py`, then hydrates the fused top-N
+chunk_ids into full `RetrievedChunk`s with one batched Postgres query
+(joining `Document`/`Company`/`TableData`).
+**Why this approach:** `retrieve()` takes a *list* of query texts, not
+one, so a single function serves both the plain-query path and
+`multi_query.py`'s expanded-query path uniformly -- every variant just
+contributes one more BM25 list and one more dense list into the same RRF
+fusion, rather than multi-query needing a separate fusion-of-fusions
+step. The two legs run in a 2-worker `ThreadPoolExecutor` per variant --
+this is safe despite SQLAlchemy's `Session` not being safe for
+*concurrent* use, because `db` (used only by the BM25 leg) is never
+touched by more than one thread at a time: the calling thread blocks on
+`.result()` rather than touching `db` while the worker thread has it,
+so it's sequential handoffs across threads, not true concurrent access.
+Both legs are wrapped to catch, log, and degrade to an empty list rather
+than propagate -- a down/misbehaving retriever leg shouldn't 500 the
+whole request when the other leg alone is still a usable, if weaker,
+result.
+**Key concepts a reviewer should understand:**
+- Hydration is a single `chunk_id IN (...)` query for the *fused,
+  trimmed* candidate set, never for raw per-leg candidates -- most of the
+  ~30-per-leg raw candidates never survive RRF fusion into the ~20 that
+  get hydrated, so this is where the expensive joined Postgres read
+  (`TableData.raw_table_json` in particular, needed later by
+  `numeric_verifier.py`) is deliberately deferred to.
+- `bm25_score`/`dense_score` on the returned `RetrievedChunk`s are only
+  ever populated from `query_variants[0]` (the primary/original
+  question) -- a per-expansion-variant score isn't a meaningful thing to
+  show or log per chunk, so only the primary query's own leg scores are
+  kept for observability.
+**Tradeoffs / deliberately left out:** `_RETRIEVE_TOP_N`/leg `top_k`
+values (30 per leg, 20 fused) are picked by inspection, not tuned against
+eval data -- flagged here and again in `query.py`'s entry as a concrete
+Phase 8 follow-up.
+**How it connects to the rest of the system:** The single entry point
+`api/v1/routes/query.py` calls for retrieval; internally composes
+`bm25_retriever.py`, `dense_retriever.py`, and `rrf.py`. Its output feeds
+`reranker.py`.
+
+---
+
+## [2026-08-09] `reranker.py`
+**Phase:** 6 -- retrieval/generation pipeline
+**What was built:** [`core/reranker.py`](../services/api/src/core/reranker.py)
+-- Cohere rerank (`rerank-v3.5`) over the RRF-fused candidates, populating
+`rerank_score` and returning the top N.
+**Why this approach:** This is the concrete case `PROJECT_HANDBOOK.md` §2
+names for why Cohere rerank is in the stack at all: the same metric
+("data center revenue") can appear near-identically worded across several
+quarters' filings, and pure vector similarity can't distinguish "the
+quarter this question is actually about" from "a quarter that happens to
+use similar words" -- a cross-encoder scoring the *actual query text*
+against each candidate can. Falls back to the incoming RRF order (no
+Cohere call at all) if `COHERE_API_KEY` is unset or the call fails --
+deliberately a different failure mode than `dense_retriever.py`'s hard
+requirement: reranking is a quality refinement on top of retrieval that
+already succeeded, so skipping it degrades ranking quality, not
+correctness. Matches the "optional-quality provider call, deterministic
+fallback" pattern `agentic_chunker.py` established in Phase 5.
+**Key concepts a reviewer should understand:**
+- The text sent to Cohere per candidate is `content` prefixed with a
+  light metadata header (ticker/document type/page) -- rerank benefits
+  from that signal too (e.g. telling apart near-identical text from two
+  different companies' filings), not just the raw passage.
+- Verified live against the real Cohere API this phase (see `docs/
+  progress.md`'s snapshot) -- a real question against the real ingested
+  Acme 10-K correctly ranked its own segment-revenue table above three
+  unrelated candidates, with a rerank score of ~0.90.
+**Tradeoffs / deliberately left out:** No caching of rerank results --
+each query pays a fresh Cohere rerank call even for a repeated question;
+`docs/architecture.md` §"Deployment Handbook"'s note on caching frequent
+queries (filings update quarterly, so aggressive caching is safe) is a
+Phase 9 concern, not addressed here.
+**How it connects to the rest of the system:** Takes `hybrid_retriever.py`'s
+output, called from `api/v1/routes/query.py`; its output (the final
+context) feeds `answer_generator.py`, `numeric_verifier.py`, and
+`citation_resolver.py` directly.
+
+---
+
+## [2026-08-09] `multi_query.py`
+**Phase:** 6 -- retrieval/generation pipeline
+**What was built:** [`core/multi_query.py`](../services/api/src/core/multi_query.py)
+-- OpenAI-generated alternative phrasings of the (already history-
+reformulated, if applicable) question, up to 2 beyond the original, fed
+into `hybrid_retriever.py` as additional query variants.
+**Why this approach:** Runs *after* `history_manager.py`'s reformulation,
+never before -- expanding a follow-up fragment like "what about margins?"
+into several phrasings of the same ambiguous fragment wouldn't improve
+recall, it would just multiply the ambiguity. Capped at 2 extra variants
+deliberately small: each variant costs one more full BM25+dense retrieval
+pair in `hybrid_retriever.py`, and this project's differentiator is
+grounded, verifiable answers, not maximal recall at any latency/cost.
+Falls back to `[query_text]` (no expansion) on a missing key or any
+failure -- expansion is a pure recall improvement, not correctness-
+critical, since `hybrid_retriever.py` always runs the original query's
+own legs regardless of whether expansion succeeded.
+**Key concepts a reviewer should understand:**
+- JSON-mode response format (`response_format={"type": "json_object"}`),
+  same pattern `agentic_chunker.py` used in Phase 5 for structured LLM
+  output, parsed defensively (a malformed/empty `variants` list just
+  falls through to the original query only).
+**Tradeoffs / deliberately left out:** No de-duplication check between a
+generated variant and the original query text beyond what the LLM itself
+avoids via the system prompt -- an accidental near-duplicate variant just
+means one of `hybrid_retriever.py`'s BM25/dense pairs is redundant, not
+wrong.
+**How it connects to the rest of the system:** Its output is
+`query.py`'s `expanded_queries`, passed straight into
+`hybrid_retriever.retrieve()`.
+
+---
+
+## [2026-08-09] `history_manager.py`
+**Phase:** 6 -- retrieval/generation pipeline
+**What was built:** [`core/history_manager.py`](../services/api/src/core/history_manager.py)
+-- rewrites a follow-up question into a self-contained one using an
+OpenAI call over the conversation's prior turns (most recent 6 kept).
+**Why this approach:** "What about their margins?" shares almost no
+retrievable vocabulary with the source text it needs to match --
+`hybrid_retriever.py` searching on that fragment literally would likely
+retrieve nothing useful. Reformulating it into "What were NVIDIA's gross
+margins in Q4 FY24?" first is what makes retrieval possible at all for a
+follow-up. Unlike `multi_query.py`'s pure-recall tradeoff, skipping this
+(no `OPENAI_API_KEY` / a failed call) has a real retrieval-quality cost,
+not just a smaller candidate pool -- accepted anyway for the same reason
+Phase 5 accepted `agentic_chunker.py`'s heuristic fallback: a degraded
+question is still a real, answerable-if-weaker request, not a system
+failure. Verified live this phase without an `OPENAI_API_KEY` configured:
+a real follow-up ("What about their revenue growth?") retrieved
+genuinely relevant chunks from the un-reformulated fragment alone, just
+with a lower Cohere rerank score (~0.32) than the initial, well-formed
+question (~0.90) -- exactly the retrieval-quality cost this entry
+describes, visible end-to-end via `confidence_scorer.py`'s
+`low_confidence` flag rather than a silent quality loss.
+**Key concepts a reviewer should understand:**
+- `prior_turns` is `[(query_text, answer_text), ...]` in the order
+  actually asked -- sourced in `query.py` from `Conversation.queries`'
+  existing `order_by="Query.created_at"` relationship (Phase 2), not
+  re-derived here.
+- `reformulated_query_text` (the `Query` row's own column, populated only
+  for follow-ups) is set to `None` when reformulation returns the
+  follow-up text unchanged, not the unchanged text itself -- preserves
+  the column's Phase 2-documented meaning ("populated only when
+  reformulation actually rewrote something").
+**Tradeoffs / deliberately left out:** No conversation summarization for
+threads longer than 6 turns -- older turns are simply dropped from the
+prompt, not summarized, since a follow-up almost always refers to recent
+context and full summarization is out of Phase 6's scope.
+**How it connects to the rest of the system:** Called only from
+`api/v1/routes/query.py`'s `submit_followup_query`; its output becomes
+`retrieval_query_text`, driving `multi_query.py`,
+`hybrid_retriever.py`, and `answer_generator.py` for that request.
+
+---
+
+## [2026-08-09] `answer_generator.py`
+**Phase:** 6 -- retrieval/generation pipeline
+**What was built:** [`core/answer_generator.py`](../services/api/src/core/answer_generator.py)
+-- grounded OpenAI generation over the reranked context, with every claim
+required (by prompt) to carry a `[n]` citation marker matching the
+1-based position of the context item it's drawn from; falls back to a
+zero-synthesis **extractive** answer (the raw content of the top 3
+reranked chunks, tagged with citation markers) when there's no
+`OPENAI_API_KEY` or the call fails.
+**Why this approach:** The extractive fallback is a deliberately stronger
+guarantee than `multi_query.py`/`history_manager.py`'s fallbacks: because
+it can only ever contain text that was literally copied from a cited
+source, it's trivially grounded by construction, with nothing for
+`numeric_verifier.py` to actually catch as wrong -- it can be a *worse*
+answer (no synthesis, no natural-language framing, a raw table dump reads
+poorly), but never a *less-grounded* one. This was this session's actual
+integration-test path: `OPENAI_API_KEY` is unset in this environment (see
+`docs/progress.md`'s Phase 5 snapshot), so every live query run this
+phase exercised the extractive fallback, not the LLM path -- confirmed
+working end-to-end (screenshot-verified through the real Chat UI) even in
+that degraded mode.
+**Key concepts a reviewer should understand:**
+- The system prompt's rule 3 ("copy numeric figures exactly ... do not
+  round, recompute, or convert units") exists specifically so
+  `numeric_verifier.py`'s comparison has a fighting chance -- a model
+  that "helpfully" reformats `$18.4 billion` as `$18,400M` would still be
+  correct, but harder to verify string-for-string; the rule reduces that
+  friction without `numeric_verifier.py` needing to be perfect at
+  catching every reformatting.
+- `chunks` is always exactly what `reranker.py` returned, in that exact
+  order -- this module never re-sorts or filters it, since the `[n]`
+  marker numbering promise (shared with `numeric_verifier.py` and
+  `query.py`'s marker-renumbering step) depends on that order staying
+  stable end-to-end.
+**Tradeoffs / deliberately left out:** No streaming -- a full
+`chat.completions.create` call, not `stream=True`, since Phase 6 has no
+SSE/websocket plumbing in `query.py`'s FastAPI routes yet; the Chat UI's
+loading state is a simple spinner, not token-by-token rendering.
+**How it connects to the rest of the system:** Consumes `reranker.py`'s
+output; its `answer_text` feeds `numeric_verifier.py` (verification) and
+(after `query.py`'s marker renumbering) becomes `Answer.answer_text`.
+
+---
+
+## [2026-08-09] `numeric_verifier.py`
+**Phase:** 6 -- retrieval/generation pipeline
+**What was built:** [`core/numeric_verifier.py`](../services/api/src/core/numeric_verifier.py)
+-- the literal implementation of `CLAUDE.md` §1's core promise: every
+numeric claim in the generated answer, checked against the exact source
+chunk/table its citation marker points to. Pure regex + arithmetic, no
+LLM call anywhere in it.
+**Why this approach:** Verifying a number by asking another LLM "does
+this look right?" would just trade one hallucination-shaped risk for
+another -- a verifier model can be wrong or sycophantic too. This module
+is deterministic on purpose: extract numbers from the claim's text
+window (the text immediately preceding its `[n]` marker), extract numbers
+from citation `n`'s actual source content, check for a real numeric
+match. The one genuinely hard sub-problem this surfaced: financial prose
+and financial tables don't use the same scale convention for "the same"
+number -- a table cell under a "Revenue ($B)" header might just say
+`18.4`, while generated prose might say "$18.4 billion" *or*, just as
+validly, "$18,400 million." Comparing only scaled values would wrongly
+fail the first case; comparing only raw digits would wrongly fail the
+second. `_matches()` tries all four raw/scaled combinations
+(claim-raw vs. source-raw, claim-scaled vs. source-raw, claim-raw vs.
+source-scaled, claim-scaled vs. source-scaled) rather than picking one
+convention and hoping the source happens to match it.
+**Key concepts a reviewer should understand:**
+- `has_scale_signal` (a `$`, `%`, decimal point, comma-thousands
+  separator, or a scale word) is what separates a "claim worth
+  verifying" from noise -- bare small integers like "4" in "last 4
+  quarters" or "2024" in a fiscal year reference are never treated as
+  numeric claims needing traceability; they're not the kind of figure
+  this project's guarantee is about, and flagging them would be pure
+  noise against the confidence score.
+- For `TABLE` chunks, source numbers are pulled from the *complete*
+  `TableData.raw_table_json` (headers + every row), never from
+  `DocumentChunk.content` -- that column holds only a 5-sample-row
+  embedding-summary string for table chunks (`table_chunker.py`'s
+  `_embedding_text`, Phase 5), and verifying against it would falsely
+  flag a correct number drawn from row 6+ as unsupported.
+- Verified live this phase against the real Acme 10-K's segment-revenue
+  table (`$120.4M`/`$171.3M`/etc. across 4 quarters x 3 segments) and,
+  separately, against 58 real numeric claims extracted from a genuine SEC
+  filing's disaggregated-revenue table (multi-million-dollar figures with
+  comma separators, parenthesized negative percentages) -- all verified
+  correctly, confirming the four-way matching actually holds up against
+  real, not synthetic, financial-table formatting. (A debugging session
+  did surface a self-inflicted bug in a throwaway verification script,
+  not this module -- feeding chunks back in the wrong order produced
+  false "unverified" results; re-run with correct ordering, matching
+  exactly how `query.py` actually calls this module, showed zero false
+  negatives.)
+**Tradeoffs / deliberately left out:** Tolerance is `rel_tol=0.02,
+abs_tol=0.05` (2% relative / small absolute) -- accepts minor rounding
+noise between a source's exact figure and a model's restated one, but
+isn't validated against a labeled mismatch set; Phase 8's eval harness is
+the right place to check whether this tolerance is too loose or too
+strict in practice. No handling of written-out number words ("eighteen
+point four billion") -- only digit-based figures are extracted.
+**How it connects to the rest of the system:** Takes `answer_generator.py`'s
+output and `reranker.py`'s chunk list (matched positionally by marker
+number); its `NumericClaimResult` list feeds `confidence_scorer.py`
+directly and is never itself persisted.
+
+---
+
+## [2026-08-09] `confidence_scorer.py`
+**Phase:** 6 -- retrieval/generation pipeline
+**What was built:** [`core/confidence_scorer.py`](../services/api/src/core/confidence_scorer.py)
+-- combines a pre-generation retrieval-confidence signal (top rerank
+score, or a saturating function of the top RRF score if rerank was
+skipped) with `numeric_verifier.py`'s results into one final
+`confidence_score` + `low_confidence` flag.
+**Why this approach:** A single unverified numeric claim caps confidence
+hard (`min(retrieval_conf, 0.35) * verification_rate`), rather than being
+averaged away against several correct claims and a strong retrieval
+score. This is a direct expression of `CLAUDE.md` §1's numeric-
+traceability promise at the scoring layer: a plausible-sounding answer
+with even one wrong number is not a confident answer, no matter how
+relevant retrieval looked. Verified live this phase against real data in
+both directions -- a well-grounded table answer scored 0.90 (high rerank
+score, all numeric claims self-verified), a vague, un-reformulated
+follow-up scored 0.32 (numeric claims all verified, but the top rerank
+score itself was genuinely low), and a nonsense out-of-corpus query
+scored 0.02 (correctly near-zero without needing a hard pre-generation
+block at all -- see `query.py`'s entry).
+**Key concepts a reviewer should understand:**
+- The RRF-score fallback (`_RRF_SATURATION_SCORE = 0.05`) is a crude,
+  explicitly-labeled normalization for the "rerank was skipped" case
+  only -- an RRF-fused score is an unbounded sum of `1/(k+rank)` terms
+  (see `rrf.py`), not a 0..1 similarity, so it can't be compared to
+  Cohere's rerank score on the same scale; this is a deliberately
+  separate code path, not a shared formula.
+**Tradeoffs / deliberately left out:** `LOW_CONFIDENCE_THRESHOLD = 0.4`
+and the `0.35` unverified-claim ceiling are both calibrated by inspection
+against this phase's live tests, not against Phase 8's (not-yet-built)
+gold eval set -- flagged as a concrete Phase 8 follow-up: revisit both
+constants once there's a labeled dataset to check them against instead of
+three manually-inspected examples.
+**How it connects to the rest of the system:** `retrieval_confidence()`
+is read by `query.py` before generation runs (informationally, not as a
+hard gate -- see that entry); `score_final()` runs after
+`numeric_verifier.py` and produces the `confidence_score`/`low_confidence`
+values written to `Answer` and returned in `QueryResponse`.
+
+---
+
+## [2026-08-09] `citation_resolver.py`
+**Phase:** 6 -- retrieval/generation pipeline
+**What was built:** [`core/citation_resolver.py`](../services/api/src/core/citation_resolver.py)
+-- maps a cited `RetrievedChunk` back to its `SourceLocation`
+(`packages/shared`), the read-path counterpart to what
+`tasks/ingest_document.py` builds at write time (Phase 5).
+**Why this approach:** For `NARRATIVE`/`FOOTNOTE` chunks, every field
+`SourceLocation` needs already lives on the Postgres row -- no I/O. For
+`TABLE` chunks, `table_cell_ref` (e.g. `"table 0"`) was **only ever
+written into Qdrant's payload** at ingestion time
+(`tasks/ingest_document.py`'s `SourceLocation(...)` construction); it
+does not exist anywhere in Postgres. Rather than re-deriving or guessing
+it here -- which would quietly violate `docs/architecture.md` §2's "never
+regenerated or re-derived" the moment ingestion's table-indexing logic
+ever changed -- this module fetches the chunk's own Qdrant point by ID
+(`chunk_id` *is* the Qdrant point ID, by construction; `qdrant_writer.py`,
+Phase 5) and reconstructs the exact `SourceLocation` ingestion originally
+wrote, via `SourceLocation.from_qdrant_payload` -- the read-side
+counterpart Phase 5 built specifically for this moment, previously
+unexercised by any code (`docs/DECISIONS_LOG.md`'s Phase 5 entry for
+`source_location.py` calls this out explicitly: "Not exercised by
+anything in Phase 5 ... included now so the shape is symmetric"). This is
+also why a BM25-only retrieval hit for a table chunk (Postgres has no
+Qdrant payload attached to it) still resolves a fully correct citation:
+the lookup happens here, uniformly, regardless of which retriever
+originally surfaced the chunk. Verified live this phase: a real query
+against the Acme 10-K's table chunk resolved `exact_location = "p.3
+(table 0)"`, confirmed correct via the Chat UI's citation panel
+screenshot.
+**Key concepts a reviewer should understand:**
+- `_fallback_source_location()` (an explicit `"table (unresolved)"`
+  marker, not a guess) is reached only if the Qdrant point lookup itself
+  fails or returns no payload -- a genuinely rare race (the point's write
+  never completed, or was later deleted), not the common path.
+- `build_snippet()` also lives here, not on the `Citation` model or in
+  `query.py` -- it's conceptually part of "what does this citation show
+  a user," the same responsibility as resolving its location.
+**Tradeoffs / deliberately left out:** One Qdrant round-trip per cited
+table chunk per request (not batched) -- acceptable because it only runs
+for the small number of chunks that made it into a *final answer's*
+citations (typically 1-3), never for raw retrieval candidates.
+**How it connects to the rest of the system:** Called from `query.py`
+for each actually-cited chunk, to build both `Citation.exact_location`
+and `Citation.snippet` before persisting.
+
+---
+
+## [2026-08-09] `CitationResponse` display fields + `get_or_create_actor` + real `POST /query`/`POST /query/followup`
+**Phase:** 6 -- retrieval/generation pipeline
+**What was built:** [`api/v1/routes/query.py`](../services/api/src/api/v1/routes/query.py)
+-- the real pipeline wiring, replacing Phase 3's stubs, shared between
+both routes via `_handle_query`. [`api/v1/deps.py`](../services/api/src/api/v1/deps.py)
+gains `get_or_create_actor()`. [`models/schemas/citation.py`](../services/api/src/models/schemas/citation.py)'s
+`CitationResponse` gains `document_title`/`document_type`/`ticker`/
+`page_number`/`fiscal_year`/`fiscal_quarter`.
+**Why this approach:**
+- **`get_or_create_actor`:** Phase 6 is the first phase that needs a
+  real, persisted `User` row -- a `Conversation.user_id` FK has to point
+  at something that actually exists, but there's still no real auth and
+  no seed script ever populated `organizations`/`users`
+  (`scripts/seed_dev_data.py`, Phase 4, only seeded `Company`/`Document`).
+  Rather than block Phase 6 on building real auth (far out of scope) or
+  inventing a differently-shaped workaround, this reuses the exact
+  find-or-create pattern `documents.py` already established for `Company`
+  in Phase 4, one level up the hierarchy (`Organization` under
+  `PLACEHOLDER_ORG_ID`, then a well-known placeholder `User` under it).
+- **Citation marker renumbering (`_renumber_markers`):** `citations` in
+  the response only contains chunks the answer *actually* cited, which
+  can be a strict subset of what was offered as context (e.g. the model
+  cites `[1]` and `[4]`, skipping `[2]`/`[3]`) -- without renumbering,
+  `citations[1]` (index 1) wouldn't correspond to marker `[4]`, and a
+  frontend would need a separate lookup mechanism to resolve a click.
+  Rewriting markers to be contiguous (`[1]`, `[2]`, ...) *before*
+  persisting `Answer.answer_text` means `citations[i]` always is the
+  `(i+1)`-th marker as it literally appears in the stored/returned text
+  -- no extra index field needed on `CitationResponse` for the frontend
+  to resolve a click, just `citations[n - 1]`.
+- **No separate pre-generation confidence gate:**
+  `docs/architecture.md` §3 frames "retrieval confidence above
+  threshold?" as a branch before generation runs at all.
+  `answer_generator.generate_answer([])` already returns a safe "not
+  enough information" message when `reranked` is empty -- the one case
+  actually worth gating on. An arbitrary numeric threshold between
+  "clearly irrelevant" and "borderline" isn't something to hardcode
+  without eval data to calibrate it against (Phase 8's job); verified
+  live this phase that a genuinely nonsense query still produces a safe,
+  correctly near-zero-confidence response without a hard gate (see
+  `confidence_scorer.py`'s entry) -- the post-generation
+  `confidence_score`/`low_confidence` signal does the "treat this
+  cautiously" job instead.
+- **`CitationResponse`'s new fields are populated by hand, not via
+  `model_validate(citation_orm)`** -- they don't live on the `Citation`
+  ORM row at all (sourced from the cited chunk's `Document`/`Company`
+  instead), so the route builds each `CitationResponse` explicitly from a
+  `(Citation, RetrievedChunk)` pair. `citations.py`'s still-stubbed route
+  (out of Phase 6's scope) needed a small matching update -- placeholder
+  values for the new required fields -- purely to keep constructing
+  correctly, not a real implementation of that route.
+**Key concepts a reviewer should understand:**
+- `submit_query` never reformulates, even when `conversation_id` is
+  passed -- per `QueryRequest`'s existing Phase 3 docstring, that's
+  `/query/followup`'s job specifically. A conversation's *first* message
+  always goes through `submit_query`.
+- Three `db.flush()` calls (`Query` -> `Answer` -> `Citation` rows), one
+  final `db.commit()` -- each flush exists only to assign the next row's
+  FK target, matching the `Company`-then-`Document` flush pattern
+  `documents.py` established in Phase 4.
+- `Conversation`/`Query` 404 handling checks `conversation.user_id ==
+  actor.user_id` -- always true today (one placeholder user), but real
+  multi-tenant hygiene once real auth exists, not dead code.
+**Tradeoffs / deliberately left out:** `_RETRIEVE_TOP_N=20`/
+`_RERANK_TOP_N=6` are picked by inspection (same caveat as
+`hybrid_retriever.py`'s per-leg `top_k` values) -- a concrete Phase 8
+follow-up, not tuned against eval data yet.
+**How it connects to the rest of the system:** The one integration point
+every Phase 6 `core/` module was built to be called from, in the exact
+pipeline order documented in this file's module docstring. Live-verified
+this phase against real ingested data (a synthetic Acme 10-K with a real
+table, a real downloaded ESOA SEC 10-K with 284 real chunks) via direct
+API calls and, separately, through the real Chat UI end-to-end
+(screenshots: a numeric answer with a correctly-resolved `p.3 (table 0)`
+citation matching the source table exactly).
+
+---
+
+## [2026-08-09] `frontend/src/app/lib/api.ts` + `frontend/src/app/pages/Chat.tsx` wired to the real query pipeline
+**Phase:** 6 -- retrieval/generation pipeline
+**What was built:** `api.ts` gains `CitationRecord`/`QueryRecord` types
+and `submitQuery`/`submitFollowupQuery`, mirroring `query.py`'s schemas.
+`Chat.tsx` replaces the hardcoded `MOCK_CITATIONS` and static example
+Q&A with real conversation state (`messages`, `conversationId`), calling
+the real API and rendering the real response.
+**Why this approach:** A conversation already in progress always calls
+`/query/followup`, never `/query` again -- once `conversationId` is set
+from the first response, every subsequent message in that thread is, by
+definition, a follow-up that should get history-aware reformulation; only
+the very first message in a thread has no history to reformulate against,
+so it goes to plain `/query`. `[n]` markers inside `answer_text` are
+parsed client-side (`text.split(/(\[\d+\])/g)`) and rendered as clickable
+badges resolved via `citations[n - 1]` -- safe specifically because
+`query.py`'s marker renumbering guarantees that positional mapping always
+holds (see that entry); without it, this would need to search `citations`
+by some other key. Each badge, on click, maps a `CitationRecord` onto
+`Layout.tsx`'s existing `Citation` shape and reuses its already-built
+"Source Citation" side panel -- no changes needed there.
+**Key concepts a reviewer should understand:**
+- The empty-conversation-thread branch (`activeProject.isEmpty`) is
+  untouched -- `Project`/`activeProject` are pure frontend/mock state
+  (no backend `Project` entity exists, and Phase 4 already established
+  documents are a shared corpus, not project- or org-scoped), so that
+  branch stays exactly as decorative as it was before this phase.
+- `low_confidence` renders as an inline amber warning per assistant
+  message (reusing the existing `AlertTriangle` styling from the old
+  mock markup), and every assistant message shows its numeric
+  `confidence_score` as a percentage badge -- the UI surface for
+  `docs/architecture.md` §3's "tag the response as low-confidence so the
+  UI can surface a warning" requirement.
+- Verified with a real headless-browser run (Playwright, driven via a
+  scratch script since no `chromium-cli`/project run-skill exists yet for
+  this repo) against the real dev server and the real API on real
+  ingested data -- not just `npm run build` succeeding. Screenshots
+  confirm: the typed question, the rendered answer with two live
+  citation badges, and the citation side panel showing the correct
+  document title/type/ticker/page and an extract matching the source
+  table's Q4 2025 Data Center revenue figure exactly.
+**Tradeoffs / deliberately left out:** No streaming/typing-indicator
+beyond a static spinner (`answer_generator.py` doesn't stream either --
+see that entry). No retry-on-failure UI beyond a plain error banner. No
+`tsconfig.json` exists yet for this frontend (flagged since Phase 1), so
+none of this was type-checked by `tsc` -- only by `vite build` (real
+esbuild transpilation + bundling, which does fail on unresolved imports
+and syntax errors) and the live browser run.
+**How it connects to the rest of the system:** The last piece of Phase
+6's "ask a real question in the Chat UI ... get back an answer with
+citations pointing to a real page number" Definition of Done
+(`PROJECT_HANDBOOK.md` §6) -- confirmed live, not just by code reading.
+
+---
+
+## [2026-08-09] `numeric_verifier.py` bugfix: uncited trailing claims were invisible, not just unverified
+**Phase:** 6 -- retrieval/generation pipeline (fix, found after adding a
+real `OPENAI_API_KEY`)
+**What was built:** A fix to
+[`numeric_verifier.verify_answer`](../services/api/src/core/numeric_verifier.py)
+-- text *after* the last `[n]` citation marker (or the whole answer, if
+it has no markers at all) is now scanned for numeric claims too, and any
+found are recorded as automatic, unverified failures (`citation_index=0`
+sentinel) instead of being silently skipped.
+**Why this approach:** Every live test up to this point in Phase 6 ran
+without `OPENAI_API_KEY` configured, so `answer_generator.py` only ever
+exercised its extractive fallback -- which, by construction, never
+produces trailing uncited text (every fallback line ends in its own
+`[n]`). The moment Sam added a real key and the LLM generation path ran
+for the first time, a real model did something the extractive fallback
+structurally can't: it answered "$171.3M ... $120.4M ... an increase of
+$50.9M" and cited the first two figures but not the third, computed one
+-- a completely ordinary thing for an LLM to do, and exactly the failure
+mode `CLAUDE.md` §1 exists to catch. `verify_answer`'s original loop only
+ever looked at the text *preceding* each marker, so a claim with no
+marker following it wasn't failing verification, it was **never being
+looked at**, and the response came back at 0.93 confidence -- high
+confidence, silently wrong. Caught immediately by re-running the exact
+same live query that had just been used as this phase's positive
+example, not by a planned test case; re-verified with a corrected debug
+script and a live re-run afterward, both confirming the fix: the same
+query now correctly returns confidence 0.23, `low_confidence: true`.
+**Key concepts a reviewer should understand:**
+- The fix's framing matters: "verified" means *traceable to a source*,
+  not *arithmetically correct*. $171.3M - $120.4M does equal $50.9M --
+  the model wasn't wrong, but the number wasn't grounded in anything the
+  system can point a citation at, and this project's numeric-
+  traceability promise is specifically about groundedness, not just
+  correctness. A number a user can't click through to a source is, for
+  this project's purposes, not a confident claim, even when it happens
+  to check out.
+- This is a strong argument for why this project's live-testing
+  discipline (real infra, real ingested data, re-running the exact query
+  that just "worked") matters more than it might look like from the
+  outside: a synthetic/mocked test for this module would have had to
+  specifically construct an uncited-trailing-claim answer to catch this;
+  a real model, asked a real comparison question, produced one on its
+  own, on the very first LLM-backed query this phase ever ran.
+**Tradeoffs / deliberately left out:** No attempt to check an uncited
+trailing claim against the *union* of all cited chunks' source text (the
+more lenient alternative) -- an uncited claim is unverifiable by
+definition regardless of whether the number happens to appear somewhere
+in the context; the strict interpretation was chosen deliberately, not
+by default.
+**How it connects to the rest of the system:** Directly changes
+`confidence_scorer.score_final`'s input for any answer with this shape;
+retroactively also applies to every already-shipped call site
+(`answer_generator.py`'s LLM path and its extractive fallback both flow
+through this function unchanged).

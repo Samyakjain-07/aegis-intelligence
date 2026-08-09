@@ -91,3 +91,69 @@ export async function uploadDocument(formData: FormData): Promise<DocumentRecord
   }
   return response.json();
 }
+
+// --- Query pipeline (PROJECT_HANDBOOK.md Phase 6) ---
+
+/** Mirrors services/api/src/models/schemas/citation.py's CitationResponse.
+ * `[n]` markers inside a QueryRecord's `answer_text` are 1-indexed and
+ * positional into this array -- `citations[n - 1]` is always the citation
+ * marker `[n]` refers to (services/api/src/api/v1/routes/query.py
+ * renumbers the model's raw citation markers to guarantee this, so the
+ * frontend never has to search for a matching id). */
+export interface CitationRecord {
+  citation_id: string;
+  answer_id: string;
+  chunk_id: string;
+  exact_location: string;
+  snippet: string;
+  document_title: string;
+  document_type: DocumentType;
+  ticker: string;
+  page_number: number;
+  fiscal_year: number;
+  fiscal_quarter: number | null;
+}
+
+/** Mirrors services/api/src/models/schemas/query.py's QueryResponse --
+ * the shape both `POST /query` and `POST /query/followup` return. */
+export interface QueryRecord {
+  query_id: string;
+  conversation_id: string;
+  query_text: string;
+  reformulated_query_text: string | null;
+  answer_text: string;
+  confidence_score: number;
+  low_confidence: boolean;
+  citations: CitationRecord[];
+  created_at: string;
+}
+
+/** A fresh question. Omit `conversationId` to start a new conversation;
+ * pass one to attach the question to an existing thread without
+ * follow-up reformulation -- see `submitFollowupQuery` for that. */
+export async function submitQuery(queryText: string, conversationId?: string): Promise<QueryRecord> {
+  const response = await fetch(`${API_BASE_URL}/query`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query_text: queryText, conversation_id: conversationId ?? null }),
+  });
+  if (!response.ok) {
+    throw new Error(await parseErrorDetail(response));
+  }
+  return response.json();
+}
+
+/** A follow-up inside an existing conversation -- the backend rewrites it
+ * into a self-contained question (history-aware reformulation) before
+ * retrieving, using that conversation's prior turns. */
+export async function submitFollowupQuery(queryText: string, conversationId: string): Promise<QueryRecord> {
+  const response = await fetch(`${API_BASE_URL}/query/followup`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query_text: queryText, conversation_id: conversationId }),
+  });
+  if (!response.ok) {
+    throw new Error(await parseErrorDetail(response));
+  }
+  return response.json();
+}
