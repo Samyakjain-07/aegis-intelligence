@@ -17,6 +17,7 @@ import cohere
 from dotenv import load_dotenv
 
 from src.core.types import RetrievedChunk
+from src.observability.tracing import traced_stage
 
 load_dotenv()
 
@@ -47,6 +48,7 @@ def _document_text(chunk: RetrievedChunk) -> str:
     return f"{header}\n{chunk.content}"
 
 
+@traced_stage("reranker.rerank")
 def rerank(query_text: str, candidates: list[RetrievedChunk], top_n: int = 8) -> list[RetrievedChunk]:
     """Reorders `candidates` by Cohere rerank relevance, populates
     `rerank_score` on each, and returns the top `top_n`.

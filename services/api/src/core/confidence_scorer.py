@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 from src.core.numeric_verifier import NumericClaimResult
 from src.core.types import RetrievedChunk
+from src.observability.tracing import traced_stage
 
 # Below this, `low_confidence=True` even with zero numeric claims to check
 # (e.g. a purely narrative question where retrieval itself was weak).
@@ -41,6 +42,7 @@ class FinalConfidence:
     low_confidence: bool
 
 
+@traced_stage("confidence_scorer.retrieval_confidence")
 def retrieval_confidence(chunks: list[RetrievedChunk]) -> float:
     """A [0, 1] "how relevant is the best candidate we actually found"
     signal, read *before* generation runs -- this is what
@@ -58,6 +60,7 @@ def retrieval_confidence(chunks: list[RetrievedChunk]) -> float:
     return max(0.0, min(1.0, (top.rrf_score or 0.0) / _RRF_SATURATION_SCORE))
 
 
+@traced_stage("confidence_scorer.score_final")
 def score_final(
     retrieval_conf: float, numeric_results: list[NumericClaimResult]
 ) -> FinalConfidence:

@@ -25,6 +25,7 @@ import re
 from dataclasses import dataclass
 
 from src.core.types import RetrievedChunk
+from src.observability.tracing import traced_stage
 
 # Scale words that multiply the digits they follow. "%"/"percent" are
 # deliberately absent -- a percentage is compared against the source's raw
@@ -140,6 +141,7 @@ def _matches(claim: _ParsedNumber, source_numbers: list[_ParsedNumber]) -> bool:
     return False
 
 
+@traced_stage("numeric_verifier.verify_answer")
 def verify_answer(answer_text: str, chunks: list[RetrievedChunk]) -> list[NumericClaimResult]:
     """Walks `answer_text` for `[n]` citation markers; for the text
     immediately preceding each marker (the claim `answer_generator.py`'s

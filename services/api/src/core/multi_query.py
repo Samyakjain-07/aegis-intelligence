@@ -24,6 +24,8 @@ import os
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from src.observability.tracing import traced_stage
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -59,6 +61,7 @@ _SYSTEM_PROMPT = (
 )
 
 
+@traced_stage("multi_query.expand_query", run_type="llm")
 def expand_query(query_text: str) -> list[str]:
     """Returns `[query_text, *variants]` -- the original question always
     comes first (`hybrid_retriever.py` treats index 0 as primary, see its

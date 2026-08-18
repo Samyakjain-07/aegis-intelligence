@@ -1,0 +1,128 @@
+name: Eval regression gate
+
+# Phase 8 (PROJECT_HANDBOOK.md §6): "Add .github/workflows/eval-regression.yml
+# running the eval suite on a schedule and failing the job if scores drop
+# below a defined threshold." Runs eval/ragas_runner.py against a real
+# `uvicorn` instance and the gold Q&A set in
+# services/api/tests/eval/eval_dataset.jsonl.
+#
+# KNOWN LIMITATION, flagged explicitly rather than silently glossed over
+# (see docs/DECISIONS_LOG.md's Phase 8 entry for this file): the
+# `schedule`/`workflow_dispatch`-triggered job below provisions a brand
+# new, empty Postgres/Qdrant per run (GitHub-hosted `services:` containers
+# have no persistent state across runs) -- it does NOT re-ingest the real
+# fixture documents (Acme Robotics' synthetic 10-K, Energy Services of
+# America's real downloaded 10-K) that back eval_dataset.jsonl's gold
+# answers, because that requires either committing large binary fixtures
+# and a synchronous (non-Celery-worker) ingestion-seeding script, or a
+# self-hosted runner pointed at Sam's already-ingested local Docker infra
+# -- both real, scoped decisions Phase 9 (Deployment) is the right place
+# to make deliberately, not something to bolt on silently here. Until
+# then, `EVAL_API_URL` can be pointed (via the `eval-api-url` input on a
+# manual `workflow_dispatch` run, or the `EVAL_API_URL` repository
+# variable for the scheduled run) at a real, already-ingested environment
+# -- a self-hosted runner on Sam's machine, or a deployed staging API --
+# for the `--fail-under` gate to mean anything; against the ephemeral
+# GitHub-hosted default it will legitimately score everything at/near 0
+# (no ingested corpus to retrieve from) and is left in report-only mode
+# (`--fail-under 0`) rather than failing every scheduled run on missing
+# infra it doesn't control.
+
+on:
+  schedule:
+    # 06:00 UTC daily -- ahead of a US-morning work session, not
+    # correlated with anything else in this repo's history.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      eval-api-url:
+        description: "Base URL of a running uvicorn instance with real ingested data (leave blank to use the ephemeral ci-provisioned API, report-only)"
+        required: false
+        default: ""
+      fail-under:
+        description: "Minimum mean retrieval_precision/groundedness_score required to pass (0 = report-only)"
+        required: false
+        default: "0"
+
+env:
+  POSTGRES_USER: aegis_ci
+  POSTGRES_PASSWORD: aegis_ci
+  POSTGRES_DB: aegis_ci
+
+jobs:
+  eval-regression:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ${{ env.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ env.POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ env.POSTGRES_DB }}
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      qdrant:
+        image: qdrant/qdrant:latest
+        ports:
+          - 6333:6333
+          - 6334:6334
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install services/api dependencies
+        working-directory: services/api
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Alembic migrations
+        working-directory: services/api
+        env:
+          DATABASE_URL: postgresql+psycopg2://${{ env.POSTGRES_USER }}:${{ env.POSTGRES_PASSWORD }}@localhost:5432/${{ env.POSTGRES_DB }}
+        run: alembic upgrade head
+
+      - name: Start the API in the background
+        if: ${{ inputs.eval-api-url == '' }}
+        working-directory: services/api
+        env:
+          DATABASE_URL: postgresql+psycopg2://${{ env.POSTGRES_USER }}:${{ env.POSTGRES_PASSWORD }}@localhost:5432/${{ env.POSTGRES_DB }}
+          QDRANT_URL: http://localhost:6333
+          REDIS_URL: redis://localhost:6379/0
+          COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          nohup uvicorn src.main:app --host 0.0.0.0 --port 8000 > uvicorn.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8000/health && break
+            sleep 1
+          done
+
+      - name: Run the eval harness
+        working-directory: .
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          API_URL="${{ inputs.eval-api-url != '' && inputs.eval-api-url || vars.EVAL_API_URL }}"
+          API_URL="${API_URL:-http://localhost:8000}"
+          FAIL_UNDER="${{ inputs.fail-under != '' && inputs.fail-under || '0' }}"
+          echo "Evaluating against: $API_URL (fail-under=$FAIL_UNDER)"
+          python eval/ragas_runner.py --api-url "$API_URL" --fail-under "$FAIL_UNDER" --no-write-db
+
+      - name: Show API logs on failure
+        if: failure() && inputs.eval-api-url == ''
+        working-directory: services/api
+        run: cat uvicorn.log || true

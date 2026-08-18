@@ -62,6 +62,7 @@ from src.models.db.conversation import Conversation
 from src.models.db.query import Query
 from src.models.schemas.citation import CitationResponse
 from src.models.schemas.query import FollowupQueryRequest, QueryRequest, QueryResponse
+from src.observability.metrics import StageTimer
 
 router = APIRouter(prefix="/query", tags=["query"])
 
@@ -135,18 +136,32 @@ def _handle_query(
     `retrieval_query_text` is what actually drives retrieval/generation
     (identical to `raw_query_text` for a fresh question, the
     history-reformulated version for a follow-up).
+
+    Timed stage-by-stage via `StageTimer` (Phase 8, `observability/
+    metrics.py`) -- `timer.log_summary()` at the bottom emits one
+    structured log line per request with each stage's latency, the
+    "latency" metric `PROJECT_HANDBOOK.md` §6 Phase 8 names; LangSmith
+    tracing (`observability/tracing.py`, applied directly to each `core/`
+    function below) is the richer per-stage view when configured, this is
+    the always-on floor under it.
     """
-    expanded_queries = multi_query.expand_query(retrieval_query_text)
-    candidates = hybrid_retriever.retrieve(db, expanded_queries, top_n=_RETRIEVE_TOP_N)
-    reranked = reranker.rerank(retrieval_query_text, candidates, top_n=_RERANK_TOP_N)
+    timer = StageTimer()
+    with timer.stage("multi_query"):
+        expanded_queries = multi_query.expand_query(retrieval_query_text)
+    with timer.stage("retrieval"):
+        candidates = hybrid_retriever.retrieve(db, expanded_queries, top_n=_RETRIEVE_TOP_N)
+    with timer.stage("rerank"):
+        reranked = reranker.rerank(retrieval_query_text, candidates, top_n=_RERANK_TOP_N)
 
     retrieval_conf = confidence_scorer.retrieval_confidence(reranked)
-    generated = answer_generator.generate_answer(retrieval_query_text, reranked)
+    with timer.stage("generation"):
+        generated = answer_generator.generate_answer(retrieval_query_text, reranked)
     # Numeric verification runs against generated.answer_text's *original*
     # marker numbers (matching reranked's positions 1:1) -- it never
     # touches the database and doesn't care whether those numbers end up
     # contiguous, so there's no need to wait for the renumbering below.
-    numeric_results = numeric_verifier.verify_answer(generated.answer_text, reranked)
+    with timer.stage("numeric_verification"):
+        numeric_results = numeric_verifier.verify_answer(generated.answer_text, reranked)
     final_confidence = confidence_scorer.score_final(retrieval_conf, numeric_results)
 
     # Renumber [n] markers to be contiguous and line up positionally with
@@ -206,6 +221,12 @@ def _handle_query(
 
     db.commit()
     db.refresh(query_row)
+
+    timer.log_summary(
+        query_id=query_row.query_id,
+        confidence_score=final_confidence.confidence_score,
+        citation_count=len(citations),
+    )
 
     return QueryResponse(
         query_id=query_row.query_id,

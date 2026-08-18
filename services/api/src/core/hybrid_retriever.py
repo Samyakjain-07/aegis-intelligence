@@ -24,6 +24,7 @@ from src.core import bm25_retriever, dense_retriever, rrf
 from src.core.types import RankedChunk, RetrievedChunk
 from src.models.db.document import Document
 from src.models.db.document_chunk import DocumentChunk
+from src.observability.tracing import traced_stage
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +119,7 @@ def _hydrate(
     return hydrated
 
 
+@traced_stage("hybrid_retriever.retrieve", run_type="retriever")
 def retrieve(db: Session, query_variants: list[str], top_n: int = 20) -> list[RetrievedChunk]:
     """`query_variants[0]` is the primary question (its own BM25/dense
     scores are attached to the returned chunks, for observability/

@@ -23,6 +23,8 @@ import os
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from src.observability.tracing import traced_stage
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -59,6 +61,7 @@ _SYSTEM_PROMPT = (
 )
 
 
+@traced_stage("history_manager.reformulate_followup", run_type="llm")
 def reformulate_followup(prior_turns: list[tuple[str, str]], follow_up_text: str) -> str:
     """`prior_turns` is `[(query_text, answer_text), ...]` in the order
     they were actually asked -- matches `Conversation.queries`'

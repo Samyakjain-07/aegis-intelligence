@@ -25,3 +25,31 @@ ruff>=0.5
 # SourceLocation (packages/shared/aegis_shared) -- see docs/progress.md's
 # Phase 5 "Immediate Next Step" carry-over and docs/DECISIONS_LOG.md.
 -e ../../packages/shared
+
+# Phase 8: eval + observability (both named in the agreed stack,
+# CLAUDE.md §3 -- "RAGAS or DeepEval" / "LangSmith or Arize Phoenix").
+# `eval/ragas_runner.py` runs inside this same venv (it imports
+# src.infra.db/src.models.db.eval_result), so RAGAS's own deps live here
+# rather than a separate eval/requirements.txt.
+ragas>=0.2                 # eval/ragas_runner.py -- faithfulness + context_precision
+langchain-openai>=0.1       # ragas's LLM-judge wrapper; reuses OPENAI_API_KEY, no new vendor
+datasets>=2.19               # ragas.evaluate()'s required input type (HuggingFace Dataset)
+langsmith>=0.1               # src/observability/tracing.py -- optional, degrades to a no-op without LANGCHAIN_API_KEY
+
+# Pinned, not left at whatever `ragas`/`langchain` would otherwise resolve:
+# ragas==0.4.3's own ragas/llms/base.py unconditionally imports
+# `langchain_community.chat_models.vertexai` at module load time (not
+# behind an optional-provider try/except), which no longer exists in
+# langchain-community's current (0.4.x) release -- that submodule was
+# removed as part of langchain-community's own "being sunset, moving to
+# standalone integration packages" migration. Discovered live this phase
+# (docs/DECISIONS_LOG.md): `pip install -r requirements.txt` alone
+# resolves langchain-community==0.4.2 and RAGAS's LLM-judged scoring
+# silently falls back to eval/ragas_runner.py's deterministic path every
+# time. Pinning to the last 0.3.x release that still has the submodule
+# (plus its own now-unlisted `dataclasses-json` dependency) is what
+# actually makes the real RAGAS path importable -- confirmed via a real
+# `python eval\ragas_runner.py` run this phase, not just a version-number
+# guess.
+langchain-community==0.3.31
+dataclasses-json>=0.6

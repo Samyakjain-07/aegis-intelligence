@@ -30,6 +30,7 @@ from aegis_shared.source_location import SourceLocation
 from src.core.dense_retriever import QDRANT_COLLECTION, get_qdrant_client
 from src.core.types import RetrievedChunk
 from src.models.db.enums import ChunkType
+from src.observability.tracing import traced_stage
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ def _fallback_source_location(chunk: RetrievedChunk) -> SourceLocation:
     )
 
 
+@traced_stage("citation_resolver.resolve_source_location")
 def resolve_source_location(chunk: RetrievedChunk) -> SourceLocation:
     """One chunk -> its `SourceLocation`. Cheap (no I/O) for
     `NARRATIVE`/`FOOTNOTE` chunks; costs one Qdrant point lookup for

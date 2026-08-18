@@ -28,6 +28,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from src.core.types import RetrievedChunk
+from src.observability.tracing import traced_stage
 
 load_dotenv()
 
@@ -100,6 +101,7 @@ def _extractive_fallback(chunks: list[RetrievedChunk]) -> str:
     return "\n\n".join(lines)
 
 
+@traced_stage("answer_generator.generate_answer", run_type="llm")
 def generate_answer(query_text: str, chunks: list[RetrievedChunk]) -> GeneratedAnswer:
     """`chunks` should already be the final, reranked, trimmed context
     (`reranker.py`'s output) -- this module doesn't retrieve or filter

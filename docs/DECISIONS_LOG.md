@@ -2714,3 +2714,337 @@ entry above; this is the last of the two pages `PROJECT_HANDBOOK.md`
 Phase 7 named, and (`MOCK_PROJECTS` in `Layout.tsx` aside -- see
 `docs/progress.md`'s Known Issues for why that one's out of scope) the
 last mock-data source in `frontend/src/app`.
+
+---
+
+## [2026-08-18] `services/api/tests/eval/eval_dataset.jsonl` -- the gold Q&A set
+**Phase:** 8 -- eval + observability
+**What was built:** A 12-item gold Q&A set (`services/api/tests/eval/
+eval_dataset.jsonl`, one JSON object per line) covering both real
+ingested documents Phase 5/6/7 already established: Acme Robotics'
+synthetic 10-K (ticker `ACME`, a real extracted segment-revenue table)
+and Energy Services of America's real downloaded 10-K (ticker `ESOA`,
+narrative-only -- no extracted tables, a documented pre-existing gap).
+**Why this approach:** Every ground-truth figure and fact was pulled by
+directly reading the two source PDFs in `data/uploads/` (gitignored, not
+previously read end-to-end in this project's own docs), not guessed or
+reconstructed from prior phases' decisions-log mentions of "the segment
+table" -- the whole point of a gold set is that its answers are
+independently verifiable against the real source, the same standard
+`numeric_verifier.py` holds the live pipeline to. Four numeric items
+against ACME's real table (a single-cell lookup, a different segment/
+quarter cell, the table's own Total row, and a multi-quarter trend
+requiring several cited figures in one answer -- deliberately escalating
+difficulty, not four near-duplicates), two ACME narrative items (business
+description, a named risk factor), three numeric items against ESOA's
+*narrative* prose (revenue, net income, backlog -- each a real dollar
+figure stated in running MD&A text, never a table cell), two ESOA
+narrative items (its three segment names, its ticker/exchange), and one
+deliberate negative control (a question about a company -- Tesla -- never
+ingested at all, where the *only* correct answer is an honest decline,
+zero citations).
+**Key concepts a reviewer should understand:**
+- The ESOA numeric items exist specifically because ESOA has **zero**
+  extracted `TABLE` chunks (`docs/DECISIONS_LOG.md`'s Phase 7 Compare
+  entry already flagged this as a live `layout_segmenter.py`/`camelot`
+  gap) -- every ESOA numeric ground truth is a figure `numeric_verifier.
+  py` must therefore verify against a `TEXT` chunk's `content` (via
+  `_source_text`'s table-less branch), the opposite code path from every
+  ACME numeric item. One gold set now exercises both branches of that
+  function, not just the table branch Phase 6 originally live-tested.
+- `expected_ticker` (matched against `CitationResponse.ticker`), not a
+  guessed `document_title` substring -- the exact strings typed into
+  `Document.title` at upload time were never recorded anywhere this
+  dataset's author could read back (both documents were ingested via
+  manual live testing, not `scripts/seed_dev_data.py`), while
+  `Company.ticker` is a value this entry can state with certainty
+  (`ACME`/`ESOA`, confirmed straight from the source PDFs' own cover
+  pages). Building a hit-rate check on a fact nobody can verify would be
+  worse than not checking it at all.
+- eval-012's negative control is graded with "any expected keyword
+  present," every other item with "all expected keywords present" -- a
+  correct decline-to-answer can be honestly worded several different ways
+  ("I couldn't find...", "not enough information...", "I'm unable to
+  answer..."), but a correct factual answer must state every part of the
+  fact asked for, not just one of several acceptable phrasings of it. See
+  `eval/ragas_runner.py`'s `_keyword_check`.
+**Tradeoffs / deliberately left out:** 12 items is small for a "gold
+set" by industry standards (RAGAS/DeepEval demos often use 50-100+) --
+deliberately sized to the two real documents this dev environment
+actually has fully ingested, per `CLAUDE.md` §1's traceability principle:
+a ground-truth answer this entry can't personally verify against the
+real source isn't worth adding just to inflate the count. `docs/
+progress.md`'s carried-over "ingest a second real quarterly filing"
+note is exactly what unlocks a larger, still-fully-verifiable set later.
+No conversational/follow-up items (`history_manager.reformulate_followup`
+untested by this set) -- every item is a single fresh `/query` call;
+follow-up-specific eval is a reasonable next addition, not in this pass's
+scope.
+**How it connects to the rest of the system:** Read entirely by
+`eval/ragas_runner.py`'s `load_dataset()`; nothing else in the codebase
+depends on this file's shape.
+
+---
+
+## [2026-08-18] `eval/ragas_runner.py` -- the eval harness
+**Phase:** 8 -- eval + observability
+**What was built:** `eval/ragas_runner.py` runs every gold item in
+`eval_dataset.jsonl` through the **real, live** query pipeline over HTTP
+(`POST /api/v1/query` against a running `uvicorn`), scores each response
+two ways -- RAGAS's LLM-judged `faithfulness`/`context_precision` when
+`OPENAI_API_KEY` and the `ragas`/`langchain-openai` packages are
+available, a deterministic ticker-match/`confidence_score` fallback when
+they aren't -- writes one `EvalResult` row per scored `Query`, prints a
+summary, and exits non-zero when `--fail-under` isn't met (the CI gate's
+hook).
+**Why this approach:** HTTP, not a direct Python import of `core/`
+pipeline internals or `api/v1/routes/query.py`'s `_handle_query` -- `eval/`
+sits outside `services/api/` in `PROJECT_HANDBOOK.md` §4's repo map
+specifically because it's meant to be an external consumer of the
+deployed system, the same relationship a real analyst's browser has to
+this API. Hitting the real endpoint exercises FastAPI's request
+validation, the full middleware stack, and response serialization exactly
+as a real request would -- a direct import would only ever test a
+partial pipeline reachable through this one script's own import path,
+which is a materially weaker guarantee for a project whose whole
+differentiator is "prove it actually works end to end," not "prove the
+internals type-check."
+
+The two-mode scoring exists because a real "X% retrieval precision, Y%
+groundedness" resume number (`CLAUDE.md` §8's target) has to come from an
+independent LLM judge to mean anything -- but requiring `OPENAI_API_KEY`
+unconditionally would mean this project's own eval gate goes fully dark
+whenever that key is absent (a fresh clone, a CI run without secrets
+configured, a rate-limited key), which is a worse failure mode than a
+clearly-labeled fallback. The fallback isn't invented from nothing: 
+`deterministic_groundedness` reuses `confidence_scorer.score_final`'s own
+output (already Phase 6's real "is this grounded" signal -- numeric
+verification can only ever lower it), and `citation_hit_rate` reuses the
+gold set's own `expected_ticker` field -- same "no meaningful X without a
+key, but never a hard failure" contract `reranker.py`/`answer_generator.
+py` already established for their own optional-provider calls, applied
+here to evaluation itself instead of retrieval/generation.
+**Key concepts a reviewer should understand:**
+- `_try_ragas_scores` is wrapped in three separate `try/except` layers
+  (import, `Dataset.from_dict`/`ragas_evaluate`, per-row NaN handling) and
+  never raises -- a RAGAS version-API mismatch (a real, recurring risk
+  with a fast-moving library) degrades this run to the deterministic
+  fallback with a printed reason, not a crashed eval run. Verified this
+  phase against a real `pip install`: `ragas==0.4.3` resolved (see
+  `services/api/requirements.txt`), a materially newer major version than
+  the `>=0.2` floor pinned there, confirming the defensive wrapping isn't
+  theoretical.
+- `EvalResult` rows are upserted on `query_id` (its schema's own
+  `unique=True` constraint) so re-running this script against the same
+  dataset doesn't grow duplicate rows -- the same idempotency concern
+  `scripts/seed_dev_data.py` solved for `Document` rows in Phase 4,
+  applied here. This is also what makes `admin.py`'s
+  `_flagged_condition()` `EvalResult.flagged_by_human` branch (written in
+  Phase 7, `docs/progress.md` noted as present-but-dormant ever since)
+  finally exercised by a real row for the first time.
+- Deliberately no `conversation_id`/follow-up reformulation path exercised
+  -- every gold item is a fresh `submit_query` call, matching
+  `eval_dataset.jsonl`'s own scope decision (see that entry's tradeoffs).
+**Tradeoffs / deliberately left out:** **Live-verified this phase, not
+just statically reviewed** -- Docker Desktop had to be started fresh (it
+wasn't running at the start of this session), `pip install`'s `ragas`
+dependency tree took a real background wait, and the live run itself
+surfaced two genuine bugs the static review above missed entirely, both
+now fixed:
+1. **A real RAGAS/langchain-community incompatibility.** The first live
+   run correctly fell back to deterministic scoring, exactly as designed
+   -- but the *reason* turned out to be worth fixing, not just tolerating:
+   `ragas==0.4.3`'s own `ragas/llms/base.py` unconditionally imports
+   `langchain_community.chat_models.vertexai` at module load time, a
+   submodule removed from `langchain-community`'s current (0.4.x) release
+   as part of that package's own "being sunset" migration. Pinning
+   `langchain-community==0.3.31` (the last release with that submodule
+   intact, plus its own now-unlisted `dataclasses-json` dependency --
+   both added to `requirements.txt` with the full story) made the real
+   RAGAS path importable; re-running produced genuine LLM-judged scores
+   (`faithfulness`/`context_precision`), materially different from and
+   *lower* than the deterministic fallback's numbers (mean groundedness
+   0.549 vs. 0.861, mean precision 0.667 vs. 0.833 on the same 12-item
+   run) -- exactly the "a more independent judge is stricter" outcome
+   this two-mode design was built to eventually surface, not a
+   coincidence.
+2. **A real data-quality bug in the dev Postgres**, unrelated to this
+   phase's own code: the `Company` row backing Energy Services of
+   America's ingested 10-K had `ticker='CORP'`/`name='CORP'` -- a
+   mistyped placeholder from manual upload testing in an earlier phase,
+   not the real `ESOA` ticker `eval_dataset.jsonl`'s five ESOA items
+   depend on. Confirmed against the source PDF's own cover page (Item 5:
+   "traded on the Nasdaq Capital Market under the symbol 'ESOA'") and
+   corrected with a single `UPDATE companies SET ticker='ESOA', name=
+   'Energy Services of America Corporation' WHERE ...` -- a data fix, not
+   a schema change, so outside `CLAUDE.md` §4's "ask before touching a
+   migrated schema" boundary; flagged here rather than done silently
+   since it changes what a live query against that row returns. (A
+   second, separate pre-existing oddity -- a `Company` row with
+   `ticker='AI'` backing an unrelated health-NLP PDF misclassified as
+   `FORM_10K`, first mentioned in Phase 7's admin-analytics entry -- was
+   left untouched: it's not referenced by this gold set, and fixing it
+   would mean altering data Phase 7's own live-verification screenshots
+   already reference.)
+
+With both fixed, a real end-to-end run (`python eval\ragas_runner.py`
+against a real `uvicorn` and the real ACME/ESOA corpus) produced: 12/12
+items scored, 0 errored, RAGAS-scored mean `retrieval_precision=0.667`,
+mean `groundedness_score=0.549`, keyword-check pass rate 10/12. The two
+keyword-check failures (`eval-007`: ESOA total revenue; `eval-011`: ESOA
+ticker/exchange) are genuine retrieval misses, not harness bugs --
+confirmed by hand via `curl`: both real live answers are honest "the
+context does not provide..." declines with zero citations, meaning
+retrieval didn't surface the right chunk for those two specific
+phrasings against ESOA's real, table-less, agentically-chunked 284-chunk
+document. This is the eval harness doing exactly its job on its very
+first real run: producing a specific, actionable retrieval-quality
+finding (not a vague "seems fine") on real data, per `CLAUDE.md` §1's eval
+mandate -- left as a real, open finding for Sam rather than papered over,
+since chasing it further (retrieval-parameter tuning) is explicitly
+Phase 8's *next* step, not this pass's. `--fail-under` was also
+live-confirmed to actually gate: `--fail-under 0.9` against these same
+real scores exits non-zero with an explicit reason printed, `--fail-under
+0` (the default) doesn't.
+**How it connects to the rest of the system:** Reads `eval_dataset.jsonl`;
+calls the real `POST /api/v1/query` route (`api/v1/routes/query.py`,
+unchanged); writes `EvalResult` rows via `src.infra.db.SessionLocal`, the
+same session factory every other write path in this codebase uses;
+imports `observability/metrics.py`'s `citation_hit_rate`/
+`deterministic_groundedness` rather than redefining either metric.
+
+---
+
+## [2026-08-18] `services/api/src/observability/{tracing,metrics}.py` -- LangSmith tracing + latency/hit-rate/groundedness metrics
+**Phase:** 8 -- eval + observability
+**What was built:** `observability/tracing.py`'s `traced_stage()`
+decorator, applied directly onto eight real `core/` pipeline functions
+(`multi_query.expand_query`, `hybrid_retriever.retrieve`, `reranker.
+rerank`, `answer_generator.generate_answer`, `numeric_verifier.
+verify_answer`, `confidence_scorer.{retrieval_confidence,score_final}`,
+`citation_resolver.resolve_source_location`, `history_manager.
+reformulate_followup`) -- every real `POST /query`/`POST /query/followup`
+request is traced stage-by-stage in LangSmith once `LANGCHAIN_API_KEY` is
+set, not left present-but-dormant in `tracing.py` alone.
+`observability/metrics.py`'s `StageTimer` is wired into `api/v1/routes/
+query.py`'s `_handle_query`, timing `multi_query`/`retrieval`/`rerank`/
+`generation`/`numeric_verification` and logging one structured summary
+line per real request.
+**Why this approach:** `traced_stage()` returns the wrapped function
+**completely unwrapped** (not a thin pass-through) when tracing isn't
+configured -- checked once, at decoration time, not per call. This
+matters more here than for `reranker.py`/`answer_generator.py`'s
+optional-provider calls: those change *what the pipeline does* when
+unset (skip a quality refinement, use an extractive fallback); tracing
+must never change *how* the pipeline behaves at all, only whether a
+side-channel trace gets emitted elsewhere -- "disabled" has to mean
+byte-identical code path, not "a thinner wrapper still runs, just doing
+less." `StageTimer`, by contrast, needs no env var to degrade gracefully:
+`time.perf_counter()` calls have no external dependency to fail, so it's
+always-on and unconditional, the always-available floor under LangSmith's
+richer (but optional) per-stage view.
+
+Applying the decorator to eight existing files (one import + one
+decorator line each, no logic touched) is a small, mechanical,
+behavior-preserving change per file -- chosen over a single wrapper
+around `_handle_query` as a whole because a single top-level trace would
+show "the query took 2.3s" without showing *which* stage inside it did,
+which is the entire diagnostic value `PROJECT_HANDBOOK.md` §6 names
+tracing for ("needed to debug *why* a specific answer went wrong, not
+just *that* it did" -- `docs/architecture.md`'s own framing, quoted in
+this repo's tech-stack table).
+**Key concepts a reviewer should understand:**
+- `run_type` (`"llm"` for the three OpenAI-backed stages, `"retriever"`
+  for `hybrid_retriever.retrieve`, `"chain"` default elsewhere) is
+  LangSmith's own vocabulary, not an Aegis-specific label -- it's what
+  makes LangSmith's UI render token counts on the `"llm"`-typed spans
+  correctly.
+- `StageTimer.log_summary()` logs `query_id`/`confidence_score`/
+  `citation_count` alongside every stage's duration in one line, through
+  the same stdlib `logging` module every other module in this codebase
+  already uses -- no new dependency, and a slow or low-confidence request
+  is greppable in logs without a separate metrics backend (none is in the
+  agreed stack, `CLAUDE.md` §3).
+- `deterministic_groundedness` (in `metrics.py`, consumed by `eval/
+  ragas_runner.py`) is documented as directly reusing `confidence_scorer.
+  score_final`'s own output rather than inventing a second, independently
+  -drifting groundedness formula -- see that entry for the full reasoning.
+**Tradeoffs / deliberately left out:** `StageTimer` **was** live-verified
+this phase -- `eval/ragas_runner.py`'s real run against a real `uvicorn`
+(see that entry) sent every one of the gold set's 12 questions through
+`_handle_query` for real, each one logging a real `query_metrics ...
+stages={...}` line with real per-stage millisecond timings, confirming
+`StageTimer`'s wiring into `query.py` and `TRACING_ENABLED`'s
+no-op-when-unset path both actually execute in a real request, not just
+type-check. What's still **not** verified live is a real LangSmith
+trace specifically: no `LANGCHAIN_API_KEY` was supplied to this session
+at all (Sam confirmed having one; it goes in his local `.env`, never
+shared with or typed into this session, per `.env.example`'s own "real
+values, never committed" rule), so `TRACING_ENABLED` was `False` for
+every real request this phase's live run made -- `traced_stage()`'s
+disabled/unwrapped path is what actually ran, confirmed indirectly by
+every request completing with identical behavior to Phase 6/7's own
+runs, but the *enabled* path (a real trace landing in the LangSmith UI)
+remains Sam's own Definition-of-Done check to perform once a real key is
+in his `.env`. No metrics backend/dashboard reads `StageTimer`'s output
+yet -- it's a structured log line today, the natural next step if a real
+time-series need shows up later (out of scope for what Phase 8 asked
+for).
+**How it connects to the rest of the system:** `tracing.py` is imported
+by eight `core/` modules; `metrics.py` is imported by both `api/v1/
+routes/query.py` (live, per-request) and `eval/ragas_runner.py` (offline,
+per gold item) -- one implementation of each metric, not two.
+
+---
+
+## [2026-08-18] `.github/workflows/eval-regression.yml` -- the CI eval-regression gate
+**Phase:** 8 -- eval + observability
+**What was built:** A scheduled (daily) + manually-dispatchable GitHub
+Actions workflow that provisions Postgres/Qdrant/Redis, runs Alembic
+migrations, starts a real `uvicorn` instance, runs `eval/ragas_runner.py`
+against it, and fails the job if `--fail-under` isn't met.
+**Why this approach:** Matches `PROJECT_HANDBOOK.md` §6 Phase 8's literal
+ask ("running the eval suite on a schedule and failing the job if scores
+drop below a defined threshold") using GitHub Actions' own `services:`
+containers for infra, the same three services `docker-compose.yml`
+already defines locally -- no new CI-only infra pattern invented.
+`workflow_dispatch` inputs (`eval-api-url`, `fail-under`) exist
+specifically so Sam can point a manual run at a real, already-ingested
+environment (a self-hosted runner on his own machine, or a future staging
+deployment) once one exists, without editing the workflow file itself.
+**Key concepts a reviewer should understand:**
+- **Honestly flagged, not silently glossed over:** the scheduled/default
+  path provisions a *brand-new, empty* Postgres+Qdrant per run --
+  GitHub-hosted `services:` containers have no state from a prior run,
+  and this workflow does **not** re-ingest Acme Robotics'/Energy Services
+  of America's real fixture PDFs into that empty database (both currently
+  live only in the gitignored, never-committed `data/uploads/` on Sam's
+  machine). Building that ingestion-in-CI path for real -- committing
+  fixture PDFs, writing a synchronous (non-Celery-worker) seeding script
+  that calls `ingest_document()` directly rather than via `.delay()`,
+  wiring `COHERE_API_KEY`/`OPENAI_API_KEY` GitHub secrets -- is real,
+  scoped Phase 9 (Deployment/CI) work, not something to bolt on silently
+  inside a Phase 8 pass named for the eval *harness*, not CI
+  infrastructure. Flagged explicitly in the workflow file's own header
+  comment, not just here.
+- Because of the above, the default ephemeral run is left in report-only
+  mode (`fail-under` input default `"0"`) -- it will legitimately score
+  every non-negative-control gold item near 0 (nothing to retrieve from a
+  corpus that was never ingested) and the one negative-control item near
+  1 (correctly finds nothing), so gating on that number today would fail
+  every scheduled run for a reason that has nothing to do with a real
+  regression. The gate only becomes meaningful once `eval-api-url`/
+  `EVAL_API_URL` points at an environment with the real corpus ingested.
+**Tradeoffs / deliberately left out:** Not run in real GitHub Actions
+this phase -- doing so requires a `git push` to a branch/PR and, for the
+`--fail-under`-gated path to mean anything, either `COHERE_API_KEY`/
+`OPENAI_API_KEY` repository secrets or a self-hosted-runner target
+neither of which this session can configure or observe the result of.
+This is a real, current limitation, not a "should work" claim dressed up
+as verified -- see this file's own header comment and `eval/
+ragas_runner.py`'s decisions-log entry for the same caveat applied to the
+harness itself.
+**How it connects to the rest of the system:** Runs `eval/ragas_runner.py`
+against `services/api/src/main.py`'s real app; the natural target for
+Phase 9's `ci.yml`/`cd-staging.yml` to eventually run alongside, and for
+the fixture-seeding follow-up noted above to complete.
