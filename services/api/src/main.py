@@ -15,7 +15,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.api.middleware.auth import AuthMiddleware
 from src.api.middleware.rate_limit import RateLimitMiddleware
 from src.api.middleware.tenant_context import TenantContextMiddleware
-from src.api.v1.routes import admin, citations, conversations, documents, health, query
+from src.api.v1.routes import (
+    admin,
+    citations,
+    compare,
+    conversations,
+    documents,
+    health,
+    query,
+)
 
 load_dotenv()
 
@@ -85,6 +93,7 @@ def create_app() -> FastAPI:
     app.include_router(conversations.router, prefix="/api/v1")
     app.include_router(citations.router, prefix="/api/v1")
     app.include_router(admin.router, prefix="/api/v1")
+    app.include_router(compare.router, prefix="/api/v1")
 
     return app
 

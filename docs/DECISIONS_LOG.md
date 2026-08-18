@@ -2479,3 +2479,238 @@ by default.
 retroactively also applies to every already-shipped call site
 (`answer_generator.py`'s LLM path and its extractive fallback both flow
 through this function unchanged).
+
+---
+
+## [2026-08-09] Compare backend: `GET /compare/metric` and `metric_comparator.py`
+**Phase:** 7 -- remaining pages (Compare, Admin)
+**What was built:** A new
+[`core/metric_comparator.py`](../services/api/src/core/metric_comparator.py)
+that finds the same table row (a "metric," e.g. "Revenue") across every
+`COMPLETED` document ingested for one company, plus a new
+[`GET /compare/metric`](../services/api/src/api/v1/routes/compare.py)
+route and [`compare.py`](../services/api/src/models/schemas/compare.py)
+schema exposing it. This is what `docs/architecture.md` §8 UC5 ("Compare
+metrics across quarters") and `PROJECT_HANDBOOK.md`'s Phase 7 prompt
+("pulls the same metric across multiple ingested quarters/documents for a
+company") actually resolve to in code.
+**Why this approach:** The matching itself is a case-insensitive
+substring match against each `TableData.raw_table_json` row's first cell,
+not an LLM/embedding lookup. A real financial table's row already carries
+the metric name as its first cell (e.g. `"Revenue"`, `"Net income"`) by
+construction of `table_extractor.py`'s never-flatten extraction (Phase
+5) -- the same reasoning `numeric_verifier.py` already established for
+this project (`CLAUDE.md` §1: prefer a boring, deterministic check over
+trading one hallucination-shaped risk for another). "First match wins"
+per document (not "best match" / ranked) was a deliberate simplification:
+a filing's primary income-statement table almost always appears before
+segment/footnote-detail tables that might reuse the same label, so
+first-match already picks the right section in the common case, and
+there's no gold set yet (that's Phase 8's job) to validate a smarter
+ranked match against. `exact_location` is resolved by building a
+`RetrievedChunk` from the matched `DocumentChunk` and reusing
+`citation_resolver.resolve_source_location` -- one Qdrant lookup per
+matched document -- rather than hand-rolling a second, possibly
+inconsistent location-string format; Compare's citations now look and
+resolve identically to Chat's.
+**Key concepts a reviewer should understand:**
+- `headers`/`values` travel to the frontend as parallel lists, never a
+  flattened string -- same "never flatten a table" principle as
+  `TableData.raw_table_json` itself, so a filing with a different column
+  structure (e.g. a comparative prior-year column) than another filing
+  doesn't get forced into a fake shared shape.
+- A 404 (`ticker` matches no ingested `Company`) is a genuinely different
+  response than a 200 with `periods: []` (`ticker` exists, `metric`
+  matched nothing anywhere) -- the frontend needs to tell "wrong ticker"
+  apart from "right ticker, metric not found," so this isn't collapsed
+  into one "not found" case.
+- `Document.chunks.and_(DocumentChunk.chunk_type == ChunkType.TABLE)`
+  (SQLAlchemy's `WITH LOADER CRITERIA`-backed relationship filtering) is
+  used so only table chunks get eager-loaded per document, instead of
+  hydrating every narrative/footnote chunk just to filter them out in
+  Python.
+- Not tenant-scoped, matching `documents.py`'s Phase 4 precedent:
+  `Document`/`Company` are shared reference data (public SEC filings),
+  with no relationship to `Organization` in the ER model.
+**Tradeoffs / deliberately left out:** Live-verified against real
+ingested data, but the two real-data fixtures currently in Postgres don't
+exercise the "same metric across *multiple separate documents*" case end
+to end: Acme Robotics' one synthetic 10-K has a single table shaped
+segment-rows x quarter-columns (all four quarters already in one table,
+one document), and the real downloaded Energy Services of America 10-K
+has zero extracted tables at all (a pre-existing Phase 5 gap --
+`camelot`/`layout_segmenter.py` didn't flag any table candidate pages on
+that particular PDF; not something this phase's scope covers fixing).
+What *is* live-verified end to end: searching `ticker=ACME,
+metric=Data+Center` correctly matches the "Data Center" row, returns its
+real quarter-by-quarter values, and resolves a real `exact_location`
+(`p.3 (table 0)`) via a real Qdrant lookup -- the full mechanism works;
+demonstrating true multi-document quarter-over-quarter comparison just
+needs more than one ingested filing per company with income-statement-
+shaped tables, which the current dev-data doesn't have yet.
+**How it connects to the rest of the system:** Reuses
+`core/citation_resolver.py` and `core/types.RetrievedChunk` from Phase 6
+rather than duplicating chunk-hydration/location-resolution logic;
+consumed by the Compare page (see the paired frontend entry below).
+
+---
+
+## [2026-08-09] Admin backend: real `GET /admin/analytics` and `GET /admin/flagged-answers`
+**Phase:** 7 -- remaining pages (Compare, Admin)
+**What was built:** Rewrote
+[`api/v1/routes/admin.py`](../services/api/src/api/v1/routes/admin.py)
+and its [schemas](../services/api/src/models/schemas/admin.py) to compute
+real KPI counters, a 7-day query-volume-vs-flagged-responses series, a
+most-cited-companies panel, and the flagged-answers review table from
+actual `Document`/`Conversation`/`Query`/`Answer`/`Citation`/`EvalResult`
+rows, replacing Phase 3's all-zero/empty placeholders.
+**Why this approach:** "Flagged" is defined as one `OR` of two signals,
+factored into a single `_flagged_condition()` helper reused by both
+routes: `Answer.confidence_score` below the *same*
+`LOW_CONFIDENCE_THRESHOLD` constant the live query pipeline already uses
+(`core/confidence_scorer.py`) -- imported, not re-declared, so the two
+can't silently drift apart -- OR a linked `EvalResult.flagged_by_human =
+True`. `EvalResult` rows don't exist yet (Phase 8's eval harness is the
+only writer, and Phase 8 hasn't been built), so today every flagged row
+reaches these endpoints via the confidence path; the human-review path is
+wired in now anyway so the query/filter shape doesn't need to change the
+moment Phase 8 starts writing `EvalResult` rows. Tenant scoping is
+deliberately inconsistent *by design*, not an oversight:
+`Conversation`/`Query`/`Answer`/`EvalResult` are scoped by `tenant.org_id`
+(joined through each `Conversation`'s owning `User`) because those tables
+genuinely belong to an organization in the ER model, while
+`total_documents`/`indexed_document_count` are not scoped, mirroring
+`documents.py`'s Phase 4 precedent that the filing corpus is shared
+reference data.
+**Key concepts a reviewer should understand:**
+- "Top Query Topics" (the original frontend mock) was deliberately
+  replaced with "Most-Cited Companies," backed by a real `GROUP BY
+  Company.ticker` over `Citation` rows. Real topic modeling would need a
+  new dependency (an embedding-clustering library, or a dedicated LLM
+  call) not already in the agreed stack (`CLAUDE.md` §3); which company's
+  filings actually got cited across real answers is genuine, queryable
+  data the existing schema already supports without one. Flagged here as
+  a deliberate scope pivot, not silently swapped in.
+- The 7-day query-volume series is always zero-filled to exactly 7 points
+  (oldest first), even on days with no activity -- computed in Python
+  from a `dict` keyed by date, not left to SQL's `GROUP BY` (which only
+  ever returns days that actually have rows), so the chart never renders
+  a gap.
+- `low_confidence_rate` is `None`, not `0.0`, when `total_queries == 0` --
+  "no data yet" and "a real 0% flagged rate" are different facts the KPI
+  card needs to be able to tell apart, the same nullable-vs-zero
+  discipline `average_confidence_score` already used since Phase 3.
+- `func.count(func.distinct(case((flagged_expr, Answer.answer_id))))` is
+  the standard SQL trick for "count distinct rows matching a condition"
+  in one aggregate pass instead of a second query -- `case()` with no
+  `else_` defaults to `NULL`, and `count(DISTINCT ...)` ignores `NULL`s.
+**Tradeoffs / deliberately left out:** No admin-only authorization check
+-- `tenant.role` is always `None` until real auth exists (`deps.py`), so
+there's nothing to check against yet; anyone can currently hit these
+routes, matching every other route's Phase 3-established precedent.
+`FlaggedAnswerResponse` has no "Reviewed" vs. "Pending Review" workflow
+status (the original frontend mock showed one) -- no such column exists
+anywhere in the ER model (`EvalResult.flagged_by_human` is a boolean
+flag, not a review-workflow state), and adding one wasn't asked for by
+this phase's scope; the frontend instead shows each flagged answer's real
+`confidence_score` where the mock showed a fabricated status badge. Live-
+verified against real Postgres data (11 real queries, 3 correctly
+flagged, 3 distinct cited tickers) -- see the paired frontend entry below
+for the screenshot-backed browser verification.
+**How it connects to the rest of the system:** Reads the exact same
+`Query`/`Answer`/`Citation`/`EvalResult` rows Phase 6's `POST /query`
+pipeline writes and the same `LOW_CONFIDENCE_THRESHOLD` it scores
+against -- this is a read-only reporting layer on top of Phase 6's write
+path, not a parallel source of truth.
+
+---
+
+## [2026-08-09] Compare.tsx wired to real data
+**Phase:** 7 -- remaining pages (Compare, Admin)
+**What was built:** Replaced `Compare.tsx`'s hardcoded `MOCK_METRICS`
+table with a real entity/metric picker calling the new
+`GET /compare/metric` endpoint, plus new `compareMetric`/
+`CompareMetricResponse`/`CompareMetricPeriod` additions to
+[`lib/api.ts`](../frontend/src/app/lib/api.ts).
+**Why this approach:** The ticker dropdown is populated from
+`fetchDocuments()` (already fetched everywhere else in the app, Phase 4)
+rather than a new `GET /companies` endpoint -- deriving the unique,
+`status === 'completed'` tickers client-side avoids adding a route this
+phase's scope didn't ask for, the same "no company-picker endpoint yet"
+gap `documents.py` already documented in Phase 4. The results table
+deliberately does *not* reproduce the original mock's fixed Q1-Q4 grid:
+real per-document tables can have different column structures (see the
+paired backend entry's tradeoffs note), so each matched period renders
+its own `headers`/`values` pairs rather than being forced into a shared
+four-quarter shape that would be dishonest about heterogeneous real data.
+Clicking a result's source location reuses `Layout.tsx`'s existing global
+citation side panel (`setActiveCitation`) instead of building a second,
+Compare-specific detail view -- genuine reuse of Phase 6's citation UI,
+not a look-alike.
+**Key concepts a reviewer should understand:**
+- Three distinct empty/error states are rendered, not collapsed into one
+  "nothing to show": no fully-ingested documents at all, a ticker/metric
+  search that ran but matched zero periods (a valid outcome, per the
+  backend's 404-vs-empty-array distinction), and a real fetch error.
+- Suggested-metric chips (`Revenue`, `Net Income`, ...) are a UI shortcut
+  only -- they just populate the same free-text input, since matching is
+  a substring search server-side, not a fixed enum the frontend needs to
+  mirror.
+**Tradeoffs / deliberately left out:** No `tsconfig.json` exists yet for
+this frontend (flagged since Phase 1), so this was verified via `vite
+build` (real transpilation/bundling) and a live Playwright browser run,
+not `tsc --noEmit`. Live-verified against the real API and real ACME
+data: selecting ticker `ACME`, metric `"Data Center"` correctly rendered
+the real `120.4 / 138.2 / 155.9 / 171.3` quarterly values and a working
+`p.3 (table 0)` source link that opens the citation panel with the
+correct document/page and the matched row highlighted -- screenshots
+confirm both the results table and the citation panel; zero browser
+console errors.
+**How it connects to the rest of the system:** Calls the Compare backend
+entry above; reuses `fetchDocuments` (Phase 4) and `Layout.tsx`'s
+citation panel (Phase 6) rather than introducing parallel versions of
+either.
+
+---
+
+## [2026-08-09] Admin.tsx wired to real data
+**Phase:** 7 -- remaining pages (Compare, Admin)
+**What was built:** Replaced `Admin.tsx`'s `MOCK_CHART_DATA`,
+`FLAGGED_QUERIES`, and the inline "Top Query Topics" array with real
+calls to `GET /admin/analytics` and `GET /admin/flagged-answers`, plus
+new `fetchAdminAnalytics`/`fetchFlaggedAnswers` additions to `lib/api.ts`.
+**Why this approach:** Both calls run via `Promise.allSettled`, not
+`Promise.all` -- analytics and the flagged-answers table are independent
+panels on the same page, so one endpoint failing (e.g. a transient DB
+hiccup) shouldn't blank out the other; each panel renders its own error
+state independently instead of the whole page failing together. The KPI
+label "Total Queries (7d)" from the original mock was changed to "Total
+Queries" (all-time) -- the backend's `total_queries` is an all-time
+counter (the *volume chart* is what's actually 7-day-windowed), and
+relabeling the KPI to match what it actually counts was judged better
+than adding a second, redundant "queries in the last 7 days" aggregate
+just to preserve the mock's exact wording.
+**Key concepts a reviewer should understand:**
+- Chart x-axis dates are formatted client-side from the backend's plain
+  ISO `date` strings (`"2026-08-09"` -> `"Aug 9"`) via `Date.UTC(...)`
+  with an explicit `timeZone: 'UTC'` in `toLocaleDateString` -- avoids
+  the classic bug where parsing a bare date string with the browser's
+  local timezone can silently roll the date back or forward a day.
+- The flagged-answers table's "Status" column (originally a fabricated
+  Pending-Review/Reviewed mock badge) was replaced with the row's real
+  `confidence_score` -- see the paired backend entry's tradeoffs note for
+  why no real "reviewed" state exists to show instead.
+**Tradeoffs / deliberately left out:** Same `vite build` +
+Playwright-live-run verification precedent as Compare.tsx (no
+`tsconfig.json` yet). Live-verified against the real API: KPI cards
+showed real counts (11 total queries, 27.3% low-confidence rate, 1 active
+analyst, 8/9 indexed documents), the volume chart rendered a real 7-day
+series with today's real spike, "Most-Cited Companies" showed real
+per-ticker citation counts (ACME 13, CORP 9, AI 1), and the flagged-
+answers table showed 3 real flagged rows with their real flag reasons and
+confidence percentages -- screenshot-backed, zero browser console errors.
+**How it connects to the rest of the system:** Calls the Admin backend
+entry above; this is the last of the two pages `PROJECT_HANDBOOK.md`
+Phase 7 named, and (`MOCK_PROJECTS` in `Layout.tsx` aside -- see
+`docs/progress.md`'s Known Issues for why that one's out of scope) the
+last mock-data source in `frontend/src/app`.

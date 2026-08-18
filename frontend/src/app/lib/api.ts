@@ -157,3 +157,118 @@ export async function submitFollowupQuery(queryText: string, conversationId: str
   }
   return response.json();
 }
+
+// --- Compare page (PROJECT_HANDBOOK.md Phase 7) ---
+
+/** Mirrors services/api/src/models/schemas/compare.py's
+ * CompareMetricPeriodResponse -- one ingested filing's matched row for the
+ * requested metric. `headers`/`values` are parallel arrays straight from
+ * that filing's own table (never a flattened string) -- see that schema's
+ * docstring for why different periods can legitimately have different
+ * column structure. */
+export interface CompareMetricPeriod {
+  document_id: string;
+  document_title: string;
+  document_type: DocumentType;
+  fiscal_year: number;
+  fiscal_quarter: number | null;
+  page_number: number;
+  matched_row_label: string;
+  headers: string[];
+  values: string[];
+  exact_location: string;
+}
+
+/** Mirrors services/api/src/models/schemas/compare.py's
+ * CompareMetricResponse. `periods` is ordered oldest-first (fiscal_year,
+ * then fiscal_quarter) and contains at most one entry per ingested
+ * document -- documents where `metric` matched no row are simply absent,
+ * not a null placeholder. */
+export interface CompareMetricResponse {
+  ticker: string;
+  company_name: string;
+  metric_query: string;
+  periods: CompareMetricPeriod[];
+}
+
+/** `GET /compare/metric` -- throws (via parseErrorDetail) on a 404, which
+ * means no ingested company matches `ticker` at all. A 200 with an empty
+ * `periods` array is a different, valid outcome: the company exists but
+ * `metric` matched no table row in any of its filings. */
+export async function compareMetric(ticker: string, metric: string): Promise<CompareMetricResponse> {
+  const params = new URLSearchParams({ ticker, metric });
+  const response = await fetch(`${API_BASE_URL}/compare/metric?${params.toString()}`);
+  if (!response.ok) {
+    throw new Error(await parseErrorDetail(response));
+  }
+  return response.json();
+}
+
+// --- Admin dashboard (PROJECT_HANDBOOK.md Phase 7) ---
+
+/** Mirrors services/api/src/models/schemas/admin.py's
+ * QueryVolumeDayResponse -- one point on the query-volume-vs-flagged
+ * chart. */
+export interface QueryVolumeDay {
+  date: string;
+  query_count: number;
+  flagged_count: number;
+}
+
+/** Mirrors services/api/src/models/schemas/admin.py's
+ * TickerCitationCountResponse. */
+export interface TickerCitationCount {
+  ticker: string;
+  citation_count: number;
+  percent_of_max: number;
+}
+
+/** Mirrors services/api/src/models/schemas/admin.py's
+ * AdminAnalyticsResponse. */
+export interface AdminAnalytics {
+  total_documents: number;
+  indexed_document_count: number;
+  total_conversations: number;
+  total_queries: number;
+  average_confidence_score: number | null;
+  flagged_answer_count: number;
+  low_confidence_rate: number | null;
+  active_analyst_count: number;
+  query_volume_last_7_days: QueryVolumeDay[];
+  top_cited_tickers: TickerCitationCount[];
+}
+
+export async function fetchAdminAnalytics(): Promise<AdminAnalytics> {
+  const response = await fetch(`${API_BASE_URL}/admin/analytics`);
+  if (!response.ok) {
+    throw new Error(await parseErrorDetail(response));
+  }
+  return response.json();
+}
+
+/** Mirrors services/api/src/models/schemas/admin.py's
+ * FlaggedAnswerResponse. */
+export interface FlaggedAnswer {
+  answer_id: string;
+  query_id: string;
+  conversation_id: string;
+  user_email: string;
+  query_text: string;
+  answer_text: string;
+  confidence_score: number;
+  flag_reason: string;
+  generated_at: string;
+}
+
+export interface FlaggedAnswersListResponse {
+  flagged_answers: FlaggedAnswer[];
+  total: number;
+}
+
+export async function fetchFlaggedAnswers(limit = 10): Promise<FlaggedAnswersListResponse> {
+  const response = await fetch(`${API_BASE_URL}/admin/flagged-answers?limit=${limit}`);
+  if (!response.ok) {
+    throw new Error(await parseErrorDetail(response));
+  }
+  return response.json();
+}
