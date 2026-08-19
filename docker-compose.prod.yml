@@ -1,0 +1,76 @@
+# Aegis Intelligence — production-shaped compose file
+#
+# Phase 9 (PROJECT_HANDBOOK.md §6). Deliberately NOT a drop-in replacement
+# for docker-compose.yml's local `postgres`/`qdrant`/`redis` containers —
+# PROJECT_HANDBOOK.md §7's "Managed services checklist" and
+# docs/architecture.md §4 both call for Qdrant Cloud, a managed Postgres
+# (RDS/Cloud SQL), and managed Redis in production, so this file only
+# defines the two services this repo actually builds images for
+# (`services/api`, `services/ingestion`'s worker) and points them at
+# externally-managed endpoints via env vars — see .env.prod.example.
+#
+# No bind mounts (the whole point of the multi-stage Dockerfiles is that
+# the image is the deployable artifact — mounting local source back in
+# would defeat that and silently diverge from what's actually pushed to
+# ECR), and `restart: unless-stopped` on both services so a host reboot or
+# a crashed process comes back without manual intervention, matching
+# docker-compose.yml's own local convention for postgres/qdrant/redis.
+#
+# HONEST LIMITATION (same pattern as .github/workflows/eval-regression.yml):
+# `docker compose -f docker-compose.prod.yml up` build + starts both
+# containers as a real smoke test of the images themselves (Phase 9's own
+# Definition of Done), but the containers will not reach a healthy state
+# without real values in `.env.prod` — either genuine managed endpoints,
+# or (for a local-only smoke test) `host.docker.internal` pointed at your
+# already-running `docker-compose.yml` containers. See
+# .env.prod.example's own comments for both shapes. This file cannot make
+# that determination for you the way a real deploy target's secret
+# manager would.
+#
+# No frontend service here — docs/architecture.md §4 places the React
+# frontend on a CDN/static host (e.g. Vercel/Netlify/S3+CloudFront), not
+# as a container next to the API, so it's out of scope for this compose
+# file by design, not an oversight.
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    image: aegis-api:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    env_file:
+      - .env.prod
+    ports:
+      # Host 8080 -> container 8000: host 8000 is already bound by an
+      # unrelated Docker container from a different local project
+      # (`veritasrag-api`) -- same class of local host-port collision
+      # docker-compose.yml's own qdrant service already documents for
+      # 6333/6334. Only the host side is remapped; the container/
+      # HEALTHCHECK below still talk to 8000 internally.
+      - "8080:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/ready"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+  ingestion-worker:
+    build:
+      context: .
+      dockerfile: services/ingestion/Dockerfile
+    image: aegis-ingestion:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    env_file:
+      - .env.prod
+    # No published ports — a Celery worker has nothing to serve over
+    # HTTP, unlike `api` above. It only needs outbound reachability to
+    # the managed Redis broker/backend and Postgres/Qdrant, all resolved
+    # from .env.prod, same as `api`.
+    healthcheck:
+      test: ["CMD", "celery", "-A", "src.infra.celery_app", "inspect", "ping", "-d", "celery@$$HOSTNAME"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3

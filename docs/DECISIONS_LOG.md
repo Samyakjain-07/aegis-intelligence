@@ -3048,3 +3048,308 @@ harness itself.
 against `services/api/src/main.py`'s real app; the natural target for
 Phase 9's `ci.yml`/`cd-staging.yml` to eventually run alongside, and for
 the fixture-seeding follow-up noted above to complete.
+
+---
+
+## [2026-08-18] `services/api/Dockerfile` + `services/ingestion/Dockerfile` -- multi-stage production images
+**Phase:** 9 -- deployment
+**What was built:** Two multi-stage Dockerfiles. Both have a `builder`
+stage that installs each service's `requirements.txt` (including
+`packages/shared`'s editable local dependency) into built wheels, and a
+slim `runtime` stage that only installs those wheels plus the service's
+own `src/` -- no compiler, no pip build cache, no `packages/shared` source
+tree in the final image. `services/api/Dockerfile` runs `uvicorn`;
+`services/ingestion/Dockerfile` runs the Celery worker and additionally
+installs Ghostscript + `libgl1`/`libglib2.0-0` at the OS level (camelot's
+real runtime dependencies, not just a build-time one).
+**Why this approach:** `pip wheel -r requirements.txt` (run from each
+service's own directory, mirroring `PROJECT_HANDBOOK.md` §5.3's exact
+local `cd services\api && pip install -r requirements.txt` working
+directory) turns `packages/shared`'s `-e ../../packages/shared` line into
+a real built wheel instead of an editable `.pth` link -- the runtime stage
+never needs `packages/shared`'s source directory to exist inside it at
+all, which is what actually makes a clean multi-stage split possible here
+without hand-rolling a workaround for the editable install. Multi-stage
+(not a single `pip install` stage) was the point of the phase's own ask --
+a compiler and pip's build cache have no reason to ship in a container
+that only ever runs `uvicorn`/`celery worker`.
+**Key concepts a reviewer should understand:**
+- **Build context is the repo root, not each service's own directory** --
+  both Dockerfiles need `packages/shared` visible alongside
+  `services/api`/`services/ingestion` in the build context, and the two
+  are only siblings from the repo root (`docker build -f
+  services/api/Dockerfile .`, not `... -f Dockerfile .` from inside
+  `services/api/`). Documented at the top of both files specifically
+  because it's the one thing most likely to trip someone up copying the
+  "obvious" `cd services/api && docker build .` command.
+- **`services/api/Dockerfile` reproduces `alembic.ini`'s own relative path
+  assumption inside the image** (`COPY services/api/... ./services/api/...`,
+  `COPY migrations ./migrations`) rather than flattening the layout --
+  `script_location = %(here)s/../../migrations` in
+  `services/api/alembic.ini` is two directories up from wherever
+  `alembic.ini` itself lives, so the image keeps the same two-level
+  relationship instead of needing a Docker-only `alembic.ini` override.
+- **`HEALTHCHECK` hits `/health/ready`, not bare `/health`** -- the real
+  readiness probe (`src/api/v1/routes/health.py`) that actually runs a
+  `SELECT 1` against Postgres, matching the same endpoint
+  `infra/terraform/main.tf`'s ALB target group health check hits, so
+  there's one definition of "this container is healthy," not two that
+  could silently disagree.
+- **`services/ingestion/Dockerfile` deliberately drops `--pool=solo`** --
+  that flag exists purely to work around native Windows's lack of
+  `os.fork()` (`services/ingestion/src/infra/celery_app.py`'s own
+  docstring, `CLAUDE.md` §8). The container runs Linux, where the default
+  `prefork` pool is strictly better; keeping `--pool=solo` here would have
+  silently thrown away real concurrency for a Windows-only reason that no
+  longer applies.
+**Tradeoffs / deliberately left out:** No non-root user complexity beyond
+a single `appuser` (`useradd --uid 1000`) -- good enough to avoid running
+as root, not a full read-only-root-filesystem/dropped-capabilities
+hardening pass, which is out of scope for a portfolio deployment. Both
+images were built locally this phase (`docker build -f
+services/api/Dockerfile .` and the ingestion equivalent, from the repo
+root, against the already-running Docker Desktop) as a real smoke test of
+the Dockerfile syntax and dependency resolution -- see
+`docs/progress.md` for the actual build outcome, since a background build
+running at the time this entry was written is not something to claim
+success for in advance.
+**How it connects to the rest of the system:** `docker-compose.prod.yml`
+builds both images from these two files; `.github/workflows/cd-staging.yml`
+builds and pushes the same two Dockerfiles to ECR; `infra/terraform/main.tf`'s
+two `aws_ecs_task_definition` resources run the resulting images.
+
+---
+
+## [2026-08-18] `docker-compose.prod.yml` + `.env.prod.example` -- production-shaped local compose file
+**Phase:** 9 -- deployment
+**What was built:** A second compose file, alongside the existing
+(local-dev-only) `docker-compose.yml`, defining just the two services this
+repo builds images for (`api`, `ingestion-worker`) and pointing them at
+externally-managed Postgres/Qdrant/Redis via env vars rather than local
+containers -- no bind mounts, `restart: unless-stopped` on both.
+`.env.prod.example` documents the variables it expects, in both their
+"real managed endpoint" and "local smoke test via `host.docker.internal`"
+shapes.
+**Why this approach:** `PROJECT_HANDBOOK.md` §7's "Managed services
+checklist" and `docs/architecture.md` §4 both name Qdrant Cloud/RDS/managed
+Redis explicitly for production -- reusing `docker-compose.yml`'s local
+`postgres`/`qdrant`/`redis` service blocks here would misrepresent what
+actually runs in production and defeat the point of a *prod-shaped* compose
+file. Keeping it a separate file (not profiles/overrides on the existing
+one) also means `docker-compose.yml`'s own "local infra only, services/api
+and services/ingestion aren't containerized here" header comment stays
+true without a rewrite.
+**Key concepts a reviewer should understand:**
+- No bind mounts is deliberate, not an oversight: the entire point of a
+  multi-stage Dockerfile is that the built image *is* the deployable
+  artifact -- mounting local source back over it would mean testing
+  something other than what actually gets pushed to ECR.
+- `env_file: .env.prod` (gitignored, matching the existing repo-root
+  `.env` convention) is a real-runtime necessity for the local smoke test
+  this file supports; a real staging/prod deploy never reads this file at
+  all -- `infra/terraform/main.tf`'s ECS task definitions inject the same
+  variables via SSM `secrets`/plain `environment`, and
+  `.github/workflows/cd-staging.yml` never touches `.env.prod`. Documented
+  explicitly in `.env.prod.example`'s own header so the two paths (local
+  compose smoke test vs. real ECS deploy) aren't conflated.
+- **A real, small bug this file's own name caused, found and fixed live
+  this phase:** `.gitignore`'s existing `.env.*` / `!.env.example` pair
+  (line 20-23) only excepts the one literal filename `.env.example` --
+  `.env.prod.example` matched the blanket `.env.*` pattern and was
+  silently gitignored despite being a placeholders-only, safe-to-commit
+  file by the same convention `.env.example` itself follows. Caught by
+  running `git status`/`git check-ignore -v .env.prod.example` after
+  writing it, not assumed correct because the file existed on disk.
+  Fixed with one added `!.env.prod.example` exception line, not a rename
+  -- `.env.prod.example` is the name that actually matches this repo's
+  own `<name>.example` convention for a `.env.prod` counterpart.
+**Tradeoffs / deliberately left out:** **Honest limitation, flagged
+explicitly (same pattern as `.github/workflows/eval-regression.yml`):**
+`docker compose -f docker-compose.prod.yml up` builds and starts both
+containers as a real test of the images themselves, but neither will
+report healthy without real values in `.env.prod` -- this session has no
+provisioned Qdrant Cloud cluster or RDS instance to point at (no AWS
+credentials, `infra/terraform` never applied), so the managed-endpoint
+path is written but not live-verified. The `host.docker.internal`
+local-smoke-test path (pointing at this repo's own already-running
+`docker-compose.yml` containers) is real infra that does exist locally
+this phase -- see `docs/progress.md` for which path was actually run and
+what it showed.
+**How it connects to the rest of the system:** Builds
+`services/api/Dockerfile` and `services/ingestion/Dockerfile`; the local
+equivalent of what `infra/terraform/main.tf`'s ECS services run in a real
+deployment.
+
+---
+
+## [2026-08-18] `infra/terraform/{main.tf,variables.tf}` -- managed Qdrant/RDS/compute scaffold
+**Phase:** 9 -- deployment
+**What was built:** A Terraform scaffold provisioning RDS Postgres,
+ElastiCache Redis, two ECR repositories, an ECS (Fargate) cluster running
+`api` (behind an ALB, health-checked against `/health/ready`) and
+`ingestion-worker` (no public endpoint) as two independently-scaled
+services, IAM for task execution, and SSM Parameter Store `SecureString`
+params for the four secrets (`db_password`, `qdrant_cloud_api_key`,
+`cohere_api_key`, `openai_api_key`) rather than plaintext task-definition
+env vars.
+**Why this approach:** AWS was picked as the concrete target (RDS,
+ElastiCache, ECS/Fargate, ALB, ECR) because `docs/architecture.md` §4's
+production diagram already names "ECS/Cloud Run" and "RDS/Cloud SQL" as
+the pair of realistic options and a scaffold has to pick one concretely to
+be buildable HCL rather than pseudo-code -- ECS/Fargate was chosen over
+Cloud Run because it pairs directly with RDS+ElastiCache+ALB in one
+provider (`aws`) instead of splitting the stack across two clouds for a
+portfolio-scoped example. SSM `SecureString` over plaintext `environment`
+entries on the task definition is a real, deliberate hardening choice, not
+scaffold theater -- plaintext task-definition env vars are visible to
+anyone with read access to the task definition itself in the AWS
+console/API, which is a meaningfully worse default than a KMS-encrypted
+parameter resolved only at task-start time, and costs one extra IAM policy
+(`aws_iam_role_policy.ecs_read_ssm_secrets`) to wire up correctly.
+**Key concepts a reviewer should understand:**
+- **Qdrant Cloud is *not* provisioned by this file** -- there is no
+  official Terraform provider for it as of this writing, so its
+  cluster is created manually through the Qdrant Cloud console
+  (`PROJECT_HANDBOOK.md` §7) and this scaffold only *consumes*
+  `var.qdrant_cloud_url`/`var.qdrant_cloud_api_key`, passing them through
+  to both ECS task definitions' `environment`/`secrets` blocks. Flagged in
+  `variables.tf`'s own comment rather than faked with a resource block
+  that would silently do nothing.
+- **Default VPC / public subnets, not a dedicated VPC** -- a deliberate
+  scope simplification for portfolio scale, flagged explicitly in
+  `variables.tf`'s header comment: a real production deployment should put
+  RDS/ElastiCache in private subnets with no public IP and route ECS
+  egress through a NAT gateway instead of `assign_public_ip = true`.
+- **`aws_lb_target_group.api`'s health check path (`/health/ready`) is the
+  same endpoint `services/api/Dockerfile`'s own `HEALTHCHECK` hits** -- one
+  definition of "healthy," reused rather than duplicated with different
+  logic in two places that could drift.
+- **`container_image_tag` defaults to `"staging-latest"`, not `"latest"`**
+  -- matches the mutable tag `.github/workflows/cd-staging.yml` pushes on
+  every merge to `main` and then triggers via
+  `aws ecs update-service --force-new-deployment`; the commit-SHA tag the
+  same workflow also pushes is what a real rollback (`terraform apply
+  -var container_image_tag=<sha>`) targets, per `PROJECT_HANDBOOK.md` §7.
+**Tradeoffs / deliberately left out:** No autoscaling policies (both
+`api_desired_count`/`ingestion_desired_count` are fixed numbers, not tied
+to request volume or SQS/queue-depth triggers, despite
+`docs/architecture.md` §4 naming exactly that as the reason the two
+services are split) -- a real next step once there's real traffic to scale
+against, not something to guess thresholds for now. `skip_final_snapshot =
+true` and a 1-day backup retention on the RDS instance are appropriate for
+a disposable staging environment, not a real production database --
+flagged inline in `main.tf` itself. **Never `terraform apply`d against a
+real AWS account this phase** -- no AWS credentials were supplied to this
+session (consistent with `.env.example`'s "real secrets never typed into a
+session" convention). What WAS actually run, since the `terraform` CLI
+isn't installed locally: the official `hashicorp/terraform` Docker image,
+mounted against `infra/terraform/`, ran a real `terraform init
+-backend=false` (downloaded and locked the `hashicorp/aws ~> 5.0`
+provider, producing the committed `.terraform.lock.hcl`), a real
+`terraform validate` (passed clean -- this catches real errors
+`terraform plan`/`apply` would also catch, like a wrong attribute name or
+bad block nesting, that a hand-review or a brace-balance check cannot),
+and a real `terraform fmt` (found and fixed three real alignment
+inconsistencies in `main.tf`). `terraform plan`/`apply` themselves were
+not run -- those need real AWS credentials, which is Sam's own step per
+the same convention above. This is meaningfully stronger verification
+than "reviewed by hand," but still short of "known to actually
+provision" -- stated precisely, not rounded up, in `docs/progress.md`.
+**How it connects to the rest of the system:** `.github/workflows/cd-staging.yml`
+pushes into the two ECR repos this file creates and rolls the two ECS
+services it defines; both Dockerfiles are what get built into those
+images.
+
+---
+
+## [2026-08-18] `.github/workflows/ci.yml` -- lint/type-check/test gate on every PR
+**Phase:** 9 -- deployment
+**What was built:** Six parallel jobs (`lint-api`, `lint-ingestion`,
+`typecheck-api`, `typecheck-ingestion`, `test-api`, `test-ingestion`)
+triggered on every PR into `main` and every push to `main`. `test-api`
+provisions the same Postgres/Qdrant/Redis `services:` containers
+`.github/workflows/eval-regression.yml` already established the pattern
+for; `test-ingestion` needs none of that (its unit suite is pure-function
+tests against `packages/shared`/parsing/chunking modules).
+**Why this approach:** Split by service and by concern (lint vs. typecheck
+vs. test) rather than one monolithic job, so a `services/ingestion`-only
+PR's CI feedback doesn't wait on `services/api`'s (often slower, real-DB)
+test job, and a lint failure surfaces without waiting for the full test
+suite -- faster useful feedback on a PR, and failures are unambiguous
+about which of the three concerns actually broke. `pytest tests -v` (not
+`pytest tests/unit -v`) in both test jobs deliberately targets whatever
+exists under each service's `tests/` directory, per each `pyproject.toml`'s
+existing `testpaths = ["tests"]` -- the literal Phase 9 ask for
+"integration tests" doesn't require a separate job or a different pytest
+invocation, just a `tests/integration/` directory to eventually populate;
+this workflow already picks it up the moment one exists.
+**Key concepts a reviewer should understand:**
+- Both lint/typecheck-ingestion jobs install Ghostscript via `apt-get`
+  before `pip install -r requirements.txt` -- `camelot-py[cv]` needs it
+  present (even just for a clean import in some code paths), the same
+  real OS-level dependency `services/ingestion/requirements.txt`'s own
+  header comment flags for local Windows dev and
+  `services/ingestion/Dockerfile`'s runtime stage installs for the same
+  reason.
+- `eval/ragas_runner.py` is linted inside `lint-api` (not a separate job)
+  because it runs inside `services/api`'s own venv and imports its `src.*`
+  modules -- see that file's own Phase 8 requirements.txt comment.
+**Tradeoffs / deliberately left out:** No frontend job -- `frontend/` has
+no `tsconfig.json` and no test suite yet (an existing, already-flagged gap
+in `docs/progress.md`'s known issues, not something newly discovered or
+silently worked around here); adding a frontend CI job with nothing real
+to lint/type-check/test would be scaffolding theater, not a real gate.
+Real next step once `frontend/` has a lint/test setup of its own, not a
+Phase 9 scope creep to invent one now.
+**How it connects to the rest of the system:** Gates every PR into `main`;
+`.github/workflows/cd-staging.yml` only runs after a merge, so this is the
+only automated check most changes to this repo ever go through before
+landing.
+
+---
+
+## [2026-08-18] `.github/workflows/cd-staging.yml` -- build/push/deploy on merge to main
+**Phase:** 9 -- deployment
+**What was built:** A two-job workflow triggered on push to `main`:
+`build-and-push` builds both Dockerfiles (matrix over `api`/`ingestion`),
+pushes each to its ECR repo under two tags (`${{ github.sha }}` and the
+mutable `staging-latest`); `deploy-staging` then force-redeploys both ECS
+services via `aws ecs update-service --force-new-deployment` and waits for
+the `api` service to stabilize.
+**Why this approach:** SHA + mutable-tag double-tagging directly
+implements `PROJECT_HANDBOOK.md` §7's explicit rollback requirement ("tag
+images with the commit SHA, not just `latest`, so a rollback is a redeploy
+of a known-good SHA") while still giving `--force-new-deployment` a stable
+tag (`staging-latest`) to pick up without needing a `terraform apply` on
+every single merge -- a rollback specifically means re-pointing
+`infra/terraform/variables.tf`'s `container_image_tag` at an old SHA and
+re-applying, not re-running this workflow. OIDC-based
+`aws-actions/configure-aws-credentials` (`role-to-assume`, no long-lived
+`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` secrets) was chosen over
+static IAM user keys as the credential path -- GitHub Actions' own
+current best practice, and avoids a long-lived AWS credential sitting in
+repository secrets indefinitely.
+**Key concepts a reviewer should understand:**
+- This workflow reads `infra/terraform/main.tf`'s own outputs
+  (`ecr_api_repository_url`, `ecr_ingestion_repository_url`,
+  `ecs_cluster_name`) as GitHub Actions *repository variables*
+  (`vars.ECR_API_REPOSITORY`, `vars.ECR_INGESTION_REPOSITORY`,
+  `vars.ECS_CLUSTER`, `vars.ECS_SERVICE_API`, `vars.ECS_SERVICE_INGESTION`)
+  -- Terraform doesn't push to GitHub itself, so these are a manual
+  one-time copy-paste from `terraform output` into the repo's Settings ->
+  Secrets and variables -> Actions once the stack is actually applied.
+  Named explicitly here so that step isn't a silent prerequisite someone
+  has to reverse-engineer from a failed run.
+**Tradeoffs / deliberately left out:** **Never run in real GitHub
+Actions this phase**, same honest-limitation pattern as
+`.github/workflows/eval-regression.yml` and `infra/terraform/main.tf`'s
+own header comment -- it needs `secrets.AWS_DEPLOY_ROLE_ARN` (an IAM role
+with an OIDC trust policy for this specific GitHub repo, itself not
+scaffolded in `infra/terraform/main.tf` -- a real Phase-9-adjacent gap,
+left for whenever this is actually deployed rather than guessed at here)
+and the Terraform stack already applied for the ECR repo/ECS cluster names
+it deploys into. Both are real, current gaps, not "should work" claims
+dressed up as verified.
+**How it connects to the rest of the system:** Consumes both Dockerfiles
+and `infra/terraform/main.tf`'s ECR/ECS resources; the automated
+counterpart to `docker-compose.prod.yml`'s manual local smoke test.

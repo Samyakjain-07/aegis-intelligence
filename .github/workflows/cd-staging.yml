@@ -1,0 +1,105 @@
+name: CD — staging
+
+# Phase 9 (PROJECT_HANDBOOK.md §6): "build + push images, deploy to
+# staging on merge to main." Builds both services/api/Dockerfile and
+# services/ingestion/Dockerfile, pushes to the two ECR repositories
+# infra/terraform/main.tf provisions (aws_ecr_repository.api /
+# .ingestion), then rolls the corresponding ECS service
+# (aws_ecs_service.api / .ingestion) to the new image via
+# `--force-new-deployment`.
+#
+# ROLLBACK (PROJECT_HANDBOOK.md §7): every image is tagged with the full
+# commit SHA, not just `staging-latest` — a rollback is
+# `terraform apply -var container_image_tag=<known-good-sha>`
+# (infra/terraform/variables.tf's container_image_tag), or manually
+# re-registering a task definition revision pointing at that SHA tag, NOT
+# a re-run of this workflow against an old commit (GitHub Actions has no
+# "re-run against a different ref" primitive that preserves the original
+# trigger semantics).
+#
+# HONEST LIMITATION, same pattern as .github/workflows/eval-regression.yml
+# and infra/terraform/main.tf's own header: never actually run end-to-end
+# this phase — needs real AWS credentials (as repository secrets) and the
+# Terraform stack already applied (for the ECR repo / ECS cluster/service
+# names it deploys into) — neither exists in this session. See
+# docs/DECISIONS_LOG.md's entry for this file for the full reasoning and
+# exactly which repository secrets/variables it depends on.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  ECS_CLUSTER: ${{ vars.ECS_CLUSTER }} # infra/terraform output ecs_cluster_name
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - service: api
+            dockerfile: services/api/Dockerfile
+            ecr_repo_var: ECR_API_REPOSITORY # infra/terraform output ecr_api_repository_url
+          - service: ingestion
+            dockerfile: services/ingestion/Dockerfile
+            ecr_repo_var: ECR_INGESTION_REPOSITORY # infra/terraform output ecr_ingestion_repository_url
+    outputs:
+      image_tag: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr-login
+
+      - name: Build and push ${{ matrix.service }} image
+        env:
+          ECR_REPOSITORY: ${{ vars[matrix.ecr_repo_var] }}
+        run: |
+          # Build context is deliberately the repo root, not
+          # services/${{ matrix.service }}/ — see the Dockerfile's own
+          # header comment (packages/shared must be visible in-context).
+          docker build \
+            -f ${{ matrix.dockerfile }} \
+            -t "$ECR_REPOSITORY:${{ github.sha }}" \
+            -t "$ECR_REPOSITORY:staging-latest" \
+            .
+          docker push "$ECR_REPOSITORY:${{ github.sha }}"
+          docker push "$ECR_REPOSITORY:staging-latest"
+
+  deploy-staging:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+
+      - name: Roll the api ECS service
+        run: |
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "${{ vars.ECS_SERVICE_API }}" \
+            --force-new-deployment
+
+      - name: Roll the ingestion-worker ECS service
+        run: |
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "${{ vars.ECS_SERVICE_INGESTION }}" \
+            --force-new-deployment
+
+      - name: Wait for the api service to stabilize
+        run: |
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "${{ vars.ECS_SERVICE_API }}"

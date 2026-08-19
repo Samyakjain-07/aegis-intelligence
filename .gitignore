@@ -21,6 +21,10 @@ build/
 .env
 .env.*
 !.env.example
+# Phase 9: same "placeholders only, real values never committed"
+# convention as .env.example above, for the production/staging shape of
+# the same variables (docker-compose.prod.yml / infra/terraform).
+!.env.prod.example
 
 # --- Docker / infra ---
 *.log

@@ -1,0 +1,178 @@
+name: CI
+
+# Phase 9 (PROJECT_HANDBOOK.md §6): "lint, type-check, unit + integration
+# tests on every PR." Runs against both services independently (mirrors
+# docs/architecture.md §4's "API and ingestion scale independently"
+# principle applied to CI: a services/ingestion-only change shouldn't wait
+# on services/api's job, or vice versa).
+#
+# INTEGRATION TESTS NOTE: both services' pyproject.toml already sets
+# `testpaths = ["tests"]` (not `tests/unit` specifically), so the
+# `pytest tests -v` steps below already run everything under tests/,
+# not just tests/unit/ — the only reason this workflow doesn't currently
+# exercise a separate integration suite is that neither service has one
+# yet (see docs/progress.md's known-issues list). Nothing about this
+# workflow needs to change once one exists; it starts running the moment
+# a tests/integration/ directory is added.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+env:
+  POSTGRES_USER: aegis_ci
+  POSTGRES_PASSWORD: aegis_ci
+  POSTGRES_DB: aegis_ci
+
+jobs:
+  lint-api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install services/api dependencies
+        working-directory: services/api
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: ruff check
+        working-directory: services/api
+        run: ruff check .
+      - name: ruff check (eval harness)
+        # eval/ragas_runner.py lives at the repo root but imports
+        # services/api's own src.* modules and runs inside its venv —
+        # see requirements.txt's Phase 8 comment. Linted here, not as a
+        # separate job, for that reason.
+        run: ruff check eval/
+
+  lint-ingestion:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install OS dependency (Ghostscript, for camelot)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ghostscript
+      - name: Install services/ingestion dependencies
+        working-directory: services/ingestion
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: ruff check
+        working-directory: services/ingestion
+        run: ruff check .
+
+  typecheck-api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install services/api dependencies
+        working-directory: services/api
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: mypy
+        working-directory: services/api
+        run: mypy src
+
+  typecheck-ingestion:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install OS dependency (Ghostscript, for camelot)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ghostscript
+      - name: Install services/ingestion dependencies
+        working-directory: services/ingestion
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: mypy
+        working-directory: services/ingestion
+        run: mypy src
+
+  test-api:
+    runs-on: ubuntu-latest
+    # Real Postgres, not SQLite — services/api/tests/unit/conftest.py's own
+    # docstring explains why (Postgres-native UUID/JSONB/ENUM column types
+    # SQLite doesn't faithfully emulate). Qdrant/Redis included for parity
+    # with what a future integration suite will need, same as
+    # .github/workflows/eval-regression.yml's existing services: block.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ${{ env.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ env.POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ env.POSTGRES_DB }}
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      qdrant:
+        image: qdrant/qdrant:latest
+        ports:
+          - 6333:6333
+          - 6334:6334
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install services/api dependencies
+        working-directory: services/api
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run Alembic migrations
+        working-directory: services/api
+        env:
+          DATABASE_URL: postgresql+psycopg2://${{ env.POSTGRES_USER }}:${{ env.POSTGRES_PASSWORD }}@localhost:5432/${{ env.POSTGRES_DB }}
+        run: alembic upgrade head
+      - name: pytest (unit + integration)
+        working-directory: services/api
+        env:
+          DATABASE_URL: postgresql+psycopg2://${{ env.POSTGRES_USER }}:${{ env.POSTGRES_PASSWORD }}@localhost:5432/${{ env.POSTGRES_DB }}
+          QDRANT_URL: http://localhost:6333
+          REDIS_URL: redis://localhost:6379/0
+        run: pytest tests -v
+
+  test-ingestion:
+    runs-on: ubuntu-latest
+    # No `services:` block — services/ingestion/tests/unit/* today are
+    # pure-function tests against packages/shared/aegis_shared and the
+    # parsing/chunking modules directly, no live Postgres/Qdrant/Redis
+    # required (unlike test-api above). Add one here too if/when a real
+    # integration suite needs it.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install OS dependency (Ghostscript, for camelot)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ghostscript
+      - name: Install services/ingestion dependencies
+        working-directory: services/ingestion
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: pytest (unit + integration)
+        working-directory: services/ingestion
+        run: pytest tests -v
